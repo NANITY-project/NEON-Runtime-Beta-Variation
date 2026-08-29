@@ -23,9 +23,11 @@
 #include "rawllm_nctr_loader.hpp"
 #include "rawllm_rocm.hpp"
 #include "rawllm_forward.hpp"
+#if defined(NANITY_ENABLE_IDLE_LOOP)
 #include "nectar_diskmem.hpp"
 #include "nectar_vision.hpp"
 #include "nectar_splice.hpp"
+#endif
 
 // =============================================================================
 // FIX (bug 2): VERBOSE_LOG timing macros.
@@ -243,6 +245,98 @@ struct Tokenizer {
         return nullptr;
     }
 
+    // FIX (bug 11 — SPM/SentencePiece tokenizer support): the code below
+    // previously assumed every model uses byte-level BPE (GPT-2 style
+    // alphabet + merge list), unconditionally. Llama/TinyLlama-family
+    // models declare tokenizer.ggml.model == "llama" and use SentencePiece
+    // vocabularies instead — raw UTF-8 vocab strings (word-boundary marked
+    // with U+2581 '▁', not a byte-remap alphabet) segmented by unigram-LM
+    // score, not a merge-rank list. Feeding an SPM vocab through the GPT-2
+    // path means almost every merged symbol misses vocab_map, and encode()
+    // falls all the way back to one <0xXX> byte-fallback token per input
+    // byte — a segmentation the model never saw in training, hence
+    // coherent-looking-but-meaningless output regardless of how correct
+    // the transformer math is.
+    bool is_spm = (meta.model == "llama");
+
+    // "<0xXX>" -> the single raw byte it represents, or -1 if `s` doesn't
+    // match that exact shape. Used on both tokenizer paths: GPT-2 byte-BPE
+    // models can still emit a literal byte-fallback token in rare cases,
+    // and SPM models use it as their primary out-of-vocab escape hatch.
+    static int parse_byte_fallback(const std::string& s) {
+        if (s.size() != 6 || s[0] != '<' || s[1] != '0' || s[2] != 'x' || s[5] != '>') return -1;
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        int hi = hex(s[3]), lo = hex(s[4]);
+        if (hi < 0 || lo < 0) return -1;
+        return (hi << 4) | lo;
+    }
+
+    // SPM greedy score-based merge: repeatedly merge the adjacent symbol
+    // pair whose concatenation exists in vocab_map with the highest score,
+    // until no mergeable pair remains. This is the standard emulation of
+    // SentencePiece's unigram segmentation via BPE-shaped merging — scores
+    // (from tokenizer.ggml.scores) stand in for the merge-rank list that
+    // GPT-2-style vocabs ship instead.
+    std::vector<std::string> spm_merge(std::vector<std::string> symbols) const {
+        while (symbols.size() > 1) {
+            float  best_score = -std::numeric_limits<float>::infinity();
+            size_t best_i     = SIZE_MAX;
+            for (size_t k = 0; k + 1 < symbols.size(); ++k) {
+                auto it = vocab_map.find(symbols[k] + symbols[k + 1]);
+                if (it == vocab_map.end()) continue;
+                float sc = (it->second >= 0 && (size_t)it->second < meta.scores.size())
+                           ? meta.scores[it->second] : 0.0f;
+                if (sc > best_score) { best_score = sc; best_i = k; }
+            }
+            if (best_i == SIZE_MAX) break;
+            symbols[best_i] += symbols[best_i + 1];
+            symbols.erase(symbols.begin() + best_i + 1);
+        }
+        return symbols;
+    }
+
+    // SPM encode for one literal chunk: ' ' -> '▁' (U+2581, SentencePiece's
+    // word-boundary marker), leading '▁' added so the first word gets one
+    // too (matches SentencePiece's add_dummy_prefix default), start from
+    // individual UTF-8 characters (not bytes — SPM vocab strings are plain
+    // UTF-8, unlike the GPT-2 byte-remap alphabet), then greedily merge.
+    // Characters SPM has no single-codepoint vocab entry for fall back to
+    // one <0xXX> token per UTF-8 byte, same escape hatch as the BPE path.
+    void encode_literal_chunk_spm(const std::string& literal, std::vector<int32_t>& ids) const {
+        std::string prefixed;
+        prefixed.reserve(literal.size() + 3);
+        prefixed += "\xE2\x96\x81";   // ▁ (U+2581) UTF-8 bytes
+        for (char c : literal) {
+            if (c == ' ') prefixed += "\xE2\x96\x81";
+            else          prefixed += c;
+        }
+
+        std::vector<std::string> symbols;
+        size_t i = 0;
+        while (i < prefixed.size()) {
+            uint32_t cp; size_t len;
+            if (!utf8_decode_one(prefixed, i, cp, len)) { len = 1; }
+            symbols.push_back(prefixed.substr(i, len));
+            i += len;
+        }
+
+        for (const std::string& sym : spm_merge(std::move(symbols))) {
+            auto it = vocab_map.find(sym);
+            if (it != vocab_map.end()) { ids.push_back(it->second); continue; }
+            for (unsigned char b : sym) {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "<0x%02X>", b);
+                auto hit = vocab_map.find(hex);
+                if (hit != vocab_map.end()) ids.push_back(hit->second);
+            }
+        }
+    }
+
     // Split text into pretokenization chunks (word / number / punctuation /
     // whitespace runs), each independently fed through BPE merges below.
     static std::vector<std::string> pretokenize(const std::string& text) {
@@ -369,6 +463,7 @@ struct Tokenizer {
         if (add_bos && bos_id >= 0) ids.push_back(bos_id);
 
         auto encode_literal_chunk = [&](const std::string& literal) {
+            if (is_spm) { encode_literal_chunk_spm(literal, ids); return; }
             for (const std::string& chunk : pretokenize(literal)) {
                 std::vector<std::string> symbols;
                 symbols.reserve(chunk.size());
@@ -424,22 +519,57 @@ struct Tokenizer {
         if (id < 0 || id >= (int32_t)meta.tokens.size()) return "";
         const std::string& t = meta.tokens[id];
 
+        // FIX (bug 11, decode half): "<0xXX>" is a byte-fallback token
+        // representing exactly one raw byte — not six literal characters.
+        // Previously this fell through the loop below, where each ASCII
+        // char of "<0xE4>" mostly self-maps through cp_to_byte (GPT-2's
+        // byte-remap table sends most printable ASCII to itself), so the
+        // token decoded as the literal text "<0xE4>" instead of the single
+        // byte 0xE4 it stands for. That's also why multi-byte UTF-8
+        // characters, split across several <0xXX> tokens by the encoder,
+        // came out as literal "<0x..>" text or "�" instead of reassembling
+        // into the intended character — this check needs to run before the
+        // per-character loop, on both tokenizer paths (GPT-2 vocabs can
+        // also emit a literal byte-fallback token, not just SPM ones).
+        int bf = parse_byte_fallback(t);
+        if (bf >= 0) {
+            pending_bytes += (char)(uint8_t)bf;
+            size_t emit_len = complete_utf8_prefix_len(pending_bytes);
+            std::string out = pending_bytes.substr(0, emit_len);
+            pending_bytes.erase(0, emit_len);
+            return out;
+        }
+
         std::string raw;
         raw.reserve(t.size());
-        size_t i = 0;
-        while (i < t.size()) {
-            uint32_t cp; size_t len;
-            if (!utf8_decode_one(t, i, cp, len)) { raw += t[i]; ++i; continue; }
-            auto it = codec.cp_to_byte.find(cp);
-            if (it != codec.cp_to_byte.end()) {
-                raw += (char)it->second;
-            } else {
-                // Not part of the byte-remap alphabet — this is a literal
-                // special-token character (e.g. from "<|im_start|>"), not a
-                // remapped byte. Emit it verbatim.
-                raw += t.substr(i, len);
+        if (is_spm) {
+            // SPM vocab strings are plain UTF-8, not byte-remapped — emit
+            // as-is except for the '▁' (U+2581) word-boundary marker,
+            // which SentencePiece uses in place of a literal space.
+            size_t i = 0;
+            while (i < t.size()) {
+                uint32_t cp; size_t len;
+                if (!utf8_decode_one(t, i, cp, len)) { raw += t[i]; ++i; continue; }
+                if (cp == 0x2581) raw += ' ';
+                else              raw += t.substr(i, len);
+                i += len;
             }
-            i += len;
+        } else {
+            size_t i = 0;
+            while (i < t.size()) {
+                uint32_t cp; size_t len;
+                if (!utf8_decode_one(t, i, cp, len)) { raw += t[i]; ++i; continue; }
+                auto it = codec.cp_to_byte.find(cp);
+                if (it != codec.cp_to_byte.end()) {
+                    raw += (char)it->second;
+                } else {
+                    // Not part of the byte-remap alphabet — this is a literal
+                    // special-token character (e.g. from "<|im_start|>"), not a
+                    // remapped byte. Emit it verbatim.
+                    raw += t.substr(i, len);
+                }
+                i += len;
+            }
         }
 
         pending_bytes += raw;
@@ -891,6 +1021,7 @@ static void run_interactive(const engine::Config& cfg,
 // end-of-reply. --idle-max-tokens caps a run for benchmarking; 0 runs until
 // killed.
 // =============================================================================
+#if defined(NANITY_ENABLE_IDLE_LOOP)
 template <typename Loader>
 static void run_idle_loop(const engine::Config& cfg,
                            const Loader& gguf,
@@ -1075,6 +1206,7 @@ static void run_idle_loop(const engine::Config& cfg,
     std::cerr << "\n[Idle] stopped after " << produced << " tokens (max_tokens reached). "
               << "still-live (never evicted, not on disk): " << aging.size() << " tokens.\n";
 }
+#endif // NANITY_ENABLE_IDLE_LOOP
 
 
 // =============================================================================
@@ -1170,12 +1302,20 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
     // ── Idle loop mode (own process — see run_idle_loop()'s comment on why
     //    this must never share a process with --interactive) ──────────────
     if (idle.enabled) {
+#if defined(NANITY_ENABLE_IDLE_LOOP)
         std::cerr << "[Mode] Idle loop — ready.\n";
         run_idle_loop(cfg, model, tok, pool, idle.seed_text, idle.sink_tokens,
                       idle.max_tokens, idle.log_every, idle.temperature, idle.top_p,
                       idle.disk_path, idle.disk_flush_every_tokens, idle.disk_flush_interval_s,
                       idle.vision_enabled, idle.vision_poll_ms);
         return 0;
+#else
+        std::cerr << "[Mode] Idle loop requested, but this build was compiled without "
+                     "NANITY_ENABLE_IDLE_LOOP (needs nectar_diskmem.hpp/nectar_vision.hpp/"
+                     "nectar_splice.hpp). Rebuild with -DNANITY_ENABLE_IDLE_LOOP and those "
+                     "headers present to use --idle.\n";
+        return 1;
+#endif
     }
 
     // ── Single-shot mode (legacy / direct CLI testing) ─────────────────────
