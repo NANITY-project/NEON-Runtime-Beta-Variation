@@ -43,7 +43,7 @@ full "why" and the exact tensor/metadata contract.
   is genuinely lossy — expect degraded output, not a faithful conversion,
   for those specific models. This is a spec limitation, not a runtime bug.
 - **Vulkan backend**: not started. CPU and ROCm (`rawllm_rocm.hpp`) exist
-  today.
+  today. (The vulkan file is purely experimental)
 - Single-operator, no independent security audit yet (see `License`).
 
 ## Build
