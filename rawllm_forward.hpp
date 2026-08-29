@@ -85,6 +85,7 @@
 #include "rawllm_common.hpp"
 #include "rawllm_loader.hpp"
 #include "rawllm_util.hpp"
+#include "rawllm_simd_dispatch.hpp"
 #include <iostream>  // for the VERBOSE_LOG std::cerr line below
 
 namespace fwd {
@@ -380,127 +381,20 @@ inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
     }
 }
 
-namespace detail_q4_0_fused {
-inline int32_t block_isum_scalar(const uint8_t* qs, const int8_t* xq) {
-    int32_t isum = 0;
-    for (int j = 0; j < 16; ++j) {
-        int lo = (qs[j] & 0x0F) - 8;
-        int hi = (qs[j] >> 4)   - 8;
-        isum += lo * (int)xq[j] + hi * (int)xq[j + 16];
-    }
-    return isum;
-}
-#if defined(RAWLLM_AVX2)
-inline int32_t block_isum_avx2(const uint8_t* qs, const int8_t* xq) {
-    __m128i raw  = _mm_loadu_si128((const __m128i*)qs);
-    __m128i mask = _mm_set1_epi8(0x0F);
-    __m128i lo_n = _mm_and_si128(raw, mask);
-    __m128i hi_n = _mm_and_si128(_mm_srli_epi16(raw, 4), mask);
-    __m128i x_lo = _mm_loadu_si128((const __m128i*)(xq));
-    __m128i x_hi = _mm_loadu_si128((const __m128i*)(xq + 16));
-    __m128i p_lo = _mm_maddubs_epi16(lo_n, x_lo);
-    __m128i p_hi = _mm_maddubs_epi16(hi_n, x_hi);
-    __m128i sum16 = _mm_add_epi16(p_lo, p_hi);
-    __m128i sum32 = _mm_madd_epi16(sum16, _mm_set1_epi16(1));
-    __m128i hi64  = _mm_unpackhi_epi64(sum32, sum32);
-    __m128i sum2  = _mm_add_epi32(sum32, hi64);
-    __m128i sum1  = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0x1));
-    int32_t uncentered = _mm_cvtsi128_si32(sum1);
-    int32_t sum_x = 0;
-    for (int j = 0; j < 32; ++j) sum_x += xq[j];
-    return uncentered - 8 * sum_x;
-}
-#endif
-} // namespace detail_q4_0_fused
-
-// Fused dot product: one Q4_0-packed weight row (raw bytes, including the
-// per-block 2-byte fp16 scales — same layout dequant_q4_0() reads) against
-// one Q8_0-quantized activation row produced by quantize_rows_q8_0() above.
-inline float dot_q4_0_q8_0(const uint8_t* w, const float* x_d, const int8_t* x_q, size_t cols) {
-    size_t nb = cols / 32;
-    float total = 0.f;
-    for (size_t b = 0; b < nb; ++b) {
-        const uint8_t* blk = w + b * 18;
-        uint16_t dh; std::memcpy(&dh, blk, 2);
-        float wd = fp16_to_fp32(dh);
-#if defined(RAWLLM_AVX2)
-        int32_t isum = detail_q4_0_fused::block_isum_avx2(blk + 2, x_q + b * 32);
-#else
-        int32_t isum = detail_q4_0_fused::block_isum_scalar(blk + 2, x_q + b * 32);
-#endif
-        total += wd * x_d[b] * (float)isum;
-    }
-    return total;
-}
-
 // ───────────────────────── SIMD numeric primitives ───────────────────────────
-// dot_f32 / axpy_f32 back the two hottest inner loops in this file — the
-// matvec accumulation in proj_all_positions() and the QK^T / weighted-V
-// accumulation in attention. RAWLLM_AVX2 / RAWLLM_AVX512 come from
-// rawllm_common.hpp and are only defined when the corresponding compiler
-// flags were actually passed (NEON.py's "Enable AVX2 intrinsics" toggle
-// passes -mavx2 -mfma); the scalar fallback below is what every build used
-// before this change, so nothing regresses on a CPU/build that lacks them.
-// FMA (separate from AVX2 itself) is checked independently via __FMA__
-// since -mavx2 alone doesn't guarantee -mfma was also passed.
-inline float dot_f32(const float* a, const float* b, size_t n) {
-#if defined(RAWLLM_AVX512)
-    __m512 acc = _mm512_setzero_ps();
-    size_t i = 0;
-    for (; i + 16 <= n; i += 16)
-        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
-    float sum = _mm512_reduce_add_ps(acc);
-    for (; i < n; ++i) sum += a[i] * b[i];
-    return sum;
-#elif defined(RAWLLM_AVX2)
-    __m256 acc = _mm256_setzero_ps();
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i), vb = _mm256_loadu_ps(b + i);
-#  if defined(__FMA__)
-        acc = _mm256_fmadd_ps(va, vb, acc);
-#  else
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
-#  endif
-    }
-    __m128 lo = _mm256_castps256_ps128(acc);
-    __m128 hi = _mm256_extractf128_ps(acc, 1);
-    __m128 s4 = _mm_add_ps(lo, hi);
-    s4 = _mm_hadd_ps(s4, s4);
-    s4 = _mm_hadd_ps(s4, s4);
-    float sum = _mm_cvtss_f32(s4);
-    for (; i < n; ++i) sum += a[i] * b[i];
-    return sum;
-#else
-    float sum = 0.f;
-    for (size_t i = 0; i < n; ++i) sum += a[i] * b[i];
-    return sum;
-#endif
-}
-
-// out[i] += w * v[i], for i in [0, n). Used for the weighted-V accumulation
-// in attention (AVX-512 skipped here deliberately — this loop runs over
-// head_dim, which is small enough that AVX2 already captures the win
-// without the extra complexity).
-inline void axpy_f32(float* out, float w, const float* v, size_t n) {
-#if defined(RAWLLM_AVX2)
-    __m256 vw = _mm256_set1_ps(w);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 vo = _mm256_loadu_ps(out + i);
-        __m256 vv = _mm256_loadu_ps(v + i);
-#  if defined(__FMA__)
-        vo = _mm256_fmadd_ps(vw, vv, vo);
-#  else
-        vo = _mm256_add_ps(vo, _mm256_mul_ps(vw, vv));
-#  endif
-        _mm256_storeu_ps(out + i, vo);
-    }
-    for (; i < n; ++i) out[i] += w * v[i];
-#else
-    for (size_t i = 0; i < n; ++i) out[i] += w * v[i];
-#endif
-}
+// dot_f32 / axpy_f32 / dot_q4_0_q8_0 / dot_q8_0_q8_0 all live in
+// rawllm_simd_dispatch.hpp now (split into rawllm_simd_scalar.hpp /
+// rawllm_simd_avx2.hpp / rawllm_simd_avx512.hpp underneath), which picks
+// AVX-512 > AVX2 > scalar at compile time from the same RAWLLM_AVX2 /
+// RAWLLM_AVX512 macros rawllm_common.hpp already defines. Pulled in here as
+// thin `using` aliases so every call site below (proj_all_positions,
+// proj_all_positions_multi, the attention QK^T/weighted-V loop) keeps
+// calling dot_f32()/axpy_f32()/dot_q4_0_q8_0()/dot_q8_0_q8_0() unqualified,
+// unchanged from before the split.
+using simd::dot_f32;
+using simd::axpy_f32;
+using simd::dot_q4_0_q8_0;
+using simd::dot_q8_0_q8_0;
 
 // ───────────────────────── matvec / projections ─────────────────────────────
 // GGUF/GGML store a 2-D weight tensor with shape = [cols, rows] where
@@ -536,15 +430,20 @@ inline void proj_all_positions(const loader::TensorInfo& W,
 
     int nthreads = std::max(1, pool.size());
 
-    // Q4_0 fast path: quantize the (small) shared activation ONCE, up front,
-    // on the calling thread -- seq*cols elements, e.g. 3072 for a seq=1
-    // decode step, trivially cheap next to the weight tensor itself -- so
-    // every dispatched row task below can use the fused kernel with no
-    // per-row quantization cost.
+    // Int8 fused fast path: quantize the (small) shared activation ONCE, up
+    // front, on the calling thread -- seq*cols elements, e.g. 3072 for a
+    // seq=1 decode step, trivially cheap next to the weight tensor itself --
+    // so every dispatched row task below can use the fused kernel with no
+    // per-row quantization cost. Covers both Q4_0 (nibble-packed, needs the
+    // bias-correction dot) and Q8_0 (already int8, needs no dequant at all,
+    // just a straight int8 dot) -- see dot_q4_0_q8_0()/dot_q8_0_q8_0() in
+    // rawllm_simd_dispatch.hpp. Every other quant type still goes through
+    // dequantize_row()+dot_f32() below unchanged.
     const bool use_q4_0_fast = (W.type == loader::GGMLType::Q4_0);
+    const bool use_q8_0_fast = (W.type == loader::GGMLType::Q8_0);
     thread_local std::vector<float>  q8_d;
     thread_local std::vector<int8_t> q8_q;
-    if (use_q4_0_fast) {
+    if (use_q4_0_fast || use_q8_0_fast) {
         size_t nb = cols / 32;
         if (q8_d.size() < seq * nb)   q8_d.resize(seq * nb);
         if (q8_q.size() < seq * cols) q8_q.resize(seq * cols);
@@ -576,13 +475,22 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (r0 >= r1) continue;
         any = true;
         pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
-                     use_q4_0_fast, q8_d_ptr, q8_q_ptr] {
+                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr] {
             size_t nb = cols / 32;
             if (use_q4_0_fast) {
                 for (size_t r = r0; r < r1; ++r) {
                     const uint8_t* row = W.data_ptr + r * row_bytes;
                     for (size_t t = 0; t < seq; ++t)
                         Y[t * y_stride + r] = dot_q4_0_q8_0(row, q8_d_ptr + t * nb,
+                                                             q8_q_ptr + t * cols, cols);
+                }
+                return;
+            }
+            if (use_q8_0_fast) {
+                for (size_t r = r0; r < r1; ++r) {
+                    const uint8_t* row = W.data_ptr + r * row_bytes;
+                    for (size_t t = 0; t < seq; ++t)
+                        Y[t * y_stride + r] = dot_q8_0_q8_0(row, q8_d_ptr + t * nb,
                                                              q8_q_ptr + t * cols, cols);
                 }
                 return;
@@ -633,11 +541,12 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                                       const float* X, size_t x_stride,
                                       size_t seq, util::ThreadPool& pool)
 {
+    enum class FastKind { None, Q4_0, Q8_0 };
     struct Span {
         const loader::TensorInfo* W;
         size_t row_bytes, cols, y_stride, r0_global, r1_global;
         float* Y;
-        bool   q4_0_fast;
+        FastKind fast;
     };
     std::vector<Span> spans;
     spans.reserve(targets.size());
@@ -648,8 +557,11 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
     // quantization of X is keyed per distinct `cols` value actually seen
     // rather than assumed uniform — in practice every current call site uses
     // a single cols value across all of its targets, so this is one
-    // quantization pass, not several.
-    size_t any_q4_0_cols = 0;
+    // quantization pass, not several. Q4_0 and Q8_0 fast targets share the
+    // SAME quantized-activation buffer (quantize_rows_q8_0()'s output format
+    // doesn't depend on the weight's quant type), so both kinds are folded
+    // into the one "any_fast_cols" consistency check below.
+    size_t any_fast_cols = 0;
     for (const auto& tg : targets) {
         if (tg.W->shape.size() < 2)
             throw std::runtime_error("forward(): expected a 2D weight tensor: " + tg.W->name);
@@ -660,16 +572,18 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                 std::to_string(cols) + ") isn't a multiple of its quant block size (" +
                 std::to_string(bs) + ") — can't dequantize safely.");
         size_t row_bytes = loader::GGUFLoader::bytes_for_type(tg.W->type, cols);
-        bool fast = (tg.W->type == loader::GGMLType::Q4_0);
-        if (fast) {
-            if (any_q4_0_cols != 0 && any_q4_0_cols != cols)
-                throw std::runtime_error("forward(): proj_all_positions_multi() got Q4_0 "
-                    "targets with mismatched input dims (" + std::to_string(any_q4_0_cols) +
+        FastKind fast = FastKind::None;
+        if (tg.W->type == loader::GGMLType::Q4_0) fast = FastKind::Q4_0;
+        else if (tg.W->type == loader::GGMLType::Q8_0) fast = FastKind::Q8_0;
+        if (fast != FastKind::None) {
+            if (any_fast_cols != 0 && any_fast_cols != cols)
+                throw std::runtime_error("forward(): proj_all_positions_multi() got fused-"
+                    "fast-path targets with mismatched input dims (" + std::to_string(any_fast_cols) +
                     " vs " + std::to_string(cols) + ") in one call — the shared Q8_0 "
-                    "activation buffer assumes all fused Q4_0 targets share `cols`, true "
-                    "at every current call site (Q/K/V share n_embd; gate/up share n_embd) "
+                    "activation buffer assumes all fused (Q4_0 or Q8_0) targets share `cols`, "
+                    "true at every current call site (Q/K/V share n_embd; gate/up share n_embd) "
                     "but not safe to assume in general.");
-            any_q4_0_cols = cols;
+            any_fast_cols = cols;
         }
         spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast});
         total += rows;
@@ -677,11 +591,11 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
 
     thread_local std::vector<float>  q8_d;
     thread_local std::vector<int8_t> q8_q;
-    if (any_q4_0_cols) {
-        size_t nb = any_q4_0_cols / 32;
+    if (any_fast_cols) {
+        size_t nb = any_fast_cols / 32;
         if (q8_d.size() < seq * nb)             q8_d.resize(seq * nb);
-        if (q8_q.size() < seq * any_q4_0_cols)  q8_q.resize(seq * any_q4_0_cols);
-        quantize_rows_q8_0(X, x_stride, any_q4_0_cols, seq, q8_d.data(), q8_q.data());
+        if (q8_q.size() < seq * any_fast_cols)  q8_q.resize(seq * any_fast_cols);
+        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data());
     }
     const float*  q8_d_ptr = q8_d.data();
     const int8_t* q8_q_ptr = q8_q.data();
@@ -699,14 +613,15 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                 size_t lo = std::max(g0, sp.r0_global);
                 size_t hi = std::min(g1, sp.r1_global);
                 if (lo >= hi) continue;
-                if (sp.q4_0_fast) {
+                if (sp.fast != FastKind::None) {
                     size_t nb = sp.cols / 32;
                     for (size_t g = lo; g < hi; ++g) {
                         size_t r = g - sp.r0_global;
                         const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
                         for (size_t t = 0; t < seq; ++t)
-                            sp.Y[t * sp.y_stride + r] = dot_q4_0_q8_0(
-                                row, q8_d_ptr + t * nb, q8_q_ptr + t * sp.cols, sp.cols);
+                            sp.Y[t * sp.y_stride + r] = (sp.fast == FastKind::Q4_0)
+                                ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_q_ptr + t * sp.cols, sp.cols)
+                                : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_q_ptr + t * sp.cols, sp.cols);
                     }
                     continue;
                 }
