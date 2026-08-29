@@ -6,4 +6,4 @@ During the initial beta engineering period, the codebase operates under a restri
 * **Restrictions:** Commercial hosting, redistribution, sub-licensing, white-labeling, or rebranding of this codebase or its derivatives under a separate name is strictly prohibited without explicit written permission from the author.
 
 ### Open-Source Commons Commitment
-The NEON runtime and `.nctr` format specification are specifically engineered to serve as public-benefit digital infrastructure. Upon formal selection,scaling, or independent milestone funding validation, this repository and all foundational architectural assets will permanently transition to a standardized, OSI-approved Free and Open Source Software (FLOSS) framework.
+The NEON runtime `.nctr` format and training specification are specifically engineered to serve as public-benefit digital infrastructure. Upon formal selection,scaling, or independent milestone funding validation, this repository and all foundational architectural assets will permanently transition to a standardized, OSI-approved Free and Open Source Software (FLOSS) framework.
