@@ -22,6 +22,7 @@
 #include "rawllm_loader.hpp"
 #include "rawllm_nctr_loader.hpp"
 #include "rawllm_rocm.hpp"
+#include "rawllm_vulkan.hpp"
 #include "rawllm_forward.hpp"
 #if defined(NANITY_ENABLE_IDLE_LOOP)
 #include "nectar_diskmem.hpp"
@@ -1450,6 +1451,27 @@ int main(int argc, char* argv[]) {
             std::cerr << "[Hardware] ROCm GPU: " << gpu.n_devices << " device(s)\n";
         } else {
             std::cerr << "[Hardware] ROCm: no devices found, running CPU-only.\n";
+        }
+#endif
+
+#if defined(USE_VULKAN)
+        // EXPERIMENTAL, informational only (matches rawllm_vulkan.hpp's own
+        // documented scope): this constructs the backend so a --vulkan build
+        // reports real device/shader availability instead of staying
+        // untested dead code, but proj_all_positions() below still always
+        // runs on the CPU thread pool — nothing here changes which path
+        // actual token generation takes. Routing real matvecs through this
+        // (deciding when GPU beats CPU for a given tensor size, handling the
+        // quantized-weight case the shader doesn't cover yet, the
+        // upload/readback cost model) is exactly the follow-up work
+        // rawllm_vulkan.hpp's header comment describes, not done here.
+        VLOG("probing Vulkan devices");
+        try {
+            static vk_backend::VulkanMatvecBackend vulkan_probe("shaders/matvec_f32.spv");
+            std::cerr << "[Hardware] Vulkan: compute device + matvec_f32 shader initialized "
+                          "(experimental — not yet used for generation).\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[Hardware] Vulkan: unavailable (" << e.what() << "), running CPU-only.\n";
         }
 #endif
 
