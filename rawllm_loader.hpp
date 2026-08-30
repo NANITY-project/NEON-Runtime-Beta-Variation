@@ -249,6 +249,15 @@ public:
         cfg.rope_scale = (float)opt_num("nanity.rope.scale_linear",               cfg.rope_scale);
         cfg.rope_dim_count = (uint32_t)opt_num("nanity.rope.dimension_count",     0.0);
 
+        // Bias tensors are opt-in, spec-v1.1: a file declares
+        // nanity.use_bias=true to signal every attn Q/K/V/O and FFN
+        // gate/up/down projection (plus the untied output projection, if
+        // present) carries an additive bias vector alongside its weight
+        // matrix. Absent this key, the file is spec-v1 bias-free and
+        // rawllm_forward.hpp's ModelWeights::build() never looks for
+        // *.bias tensors at all -- same as before this was added.
+        cfg.use_bias = opt_num("nanity.use_bias", 0.0) != 0.0;
+
         if (cfg.n_embd == 0 || cfg.n_layer == 0 || cfg.n_head == 0 ||
             cfg.n_kv_head == 0 || cfg.head_dim == 0 || cfg.n_ff == 0)
             throw std::runtime_error("NANITY: one or more required hyperparameters is zero.");
@@ -318,6 +327,12 @@ public:
                     "NANITY: 'output.weight' shape " + shape_str(sh) +
                     " doesn't match [embedding_length, vocab_size] = [" +
                     std::to_string(cfg.n_embd) + ", " + std::to_string(cfg.n_vocab) + "].");
+            // output.bias only makes sense when output is untied -- a tied
+            // (embedding-shared) output has no separate bias concept, so
+            // this file doesn't even look for output.bias if output.weight
+            // is absent, matching ModelWeights::build()'s existing
+            // "if (mw.output) mw.output_bias = ..." behavior in forward.hpp.
+            if (cfg.use_bias) check1d("output.bias", cfg.n_vocab);
         }
 
         for (uint32_t i = 0; i < cfg.n_layer; ++i) {
@@ -331,6 +346,21 @@ public:
             check2d(p + "ffn_gate.weight",    cfg.n_embd, cfg.n_ff);
             check2d(p + "ffn_up.weight",      cfg.n_embd, cfg.n_ff);
             check2d(p + "ffn_down.weight",    cfg.n_ff,   cfg.n_embd);
+
+            // Bias vectors, one per projection above, present iff
+            // nanity.use_bias=true. Checked with the same loud-fail
+            // philosophy as the weight tensors -- a file that claims
+            // use_bias but is missing/misshapes one of these fails here,
+            // not three layers into a forward pass with silently-zero bias.
+            if (cfg.use_bias) {
+                check1d(p + "attn_q.bias",      q_dim);
+                check1d(p + "attn_k.bias",      kv_dim);
+                check1d(p + "attn_v.bias",      kv_dim);
+                check1d(p + "attn_output.bias", cfg.n_embd);
+                check1d(p + "ffn_gate.bias",    cfg.n_ff);
+                check1d(p + "ffn_up.bias",      cfg.n_ff);
+                check1d(p + "ffn_down.bias",    cfg.n_embd);
+            }
         }
 
         if (cfg.kv_window == 0)
