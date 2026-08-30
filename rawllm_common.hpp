@@ -142,7 +142,23 @@ struct Config {
     //                     like Nanity X1 (32-layer, n_embd=3072) export this
     //                     variant. The down-projection is otherwise identical.
     bool     use_swiglu       = true;
+
+    // Bias-tensor flag — set by validate_config() from the optional
+    // nanity.use_bias metadata key; never set by callers directly.
+    //
+    //   false (default) → spec-v1 bias-free: no attn Q/K/V/O or FFN
+    //                     gate/up/down projection carries a bias vector,
+    //                     and ModelWeights::build() (rawllm_forward.hpp)
+    //                     never looks for *.bias tensors at all.
+    //
+    //   true             → spec-v1.1 bias-enabled: every layer's
+    //                     attn_q/attn_k/attn_v/attn_output.bias and
+    //                     ffn_gate/ffn_up/ffn_down.bias must be present
+    //                     (validate_config() checks their shapes), plus
+    //                     output.bias if output.weight is untied. Needed
+    //                     for GPT-2/OPT-style checkpoints that were
+    //                     trained with bias terms.
+    bool     use_bias         = false;
 };
 
 } // namespace engine
-
