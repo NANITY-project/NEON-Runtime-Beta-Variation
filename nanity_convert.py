@@ -157,6 +157,7 @@ GLOBAL_ROLE_PATTERNS: list[tuple[str, list[str]]] = [
     ("token_embd",  [r"token_embd\.weight$", r"model\.embed_tokens\.weight$"]),
     ("output_norm", [r"output_norm\.weight$", r"model\.norm\.weight$"]),
     ("output",      [r"output\.weight$", r"lm_head\.weight$"]),
+    ("output_bias", [r"output\.bias$", r"lm_head\.bias$"]),
 ]
 
 
@@ -335,10 +336,17 @@ def nanity_compat_report(cfg: InferredConfig) -> dict:
             f"only clean fix is extending the runtime to support partial rotation under a new spec_version.")
 
     if cfg.has_any_bias:
-        blocking.append(
-            f"BIAS TENSORS FOUND ({len(cfg.bias_tensors_found)}): NANITY has no bias terms anywhere. "
-            f"Zero-valued biases are dropped for free (lossless). Non-zero biases will cause this script "
-            f"to refuse unless you pass --drop-nonzero-bias-anyway.")
+        mechanical.append(
+            f"BIAS TENSORS FOUND ({len(cfg.bias_tensors_found)}): NANITY v1.1 has an opt-in bias path "
+            f"(nanity.use_bias). These will be preserved losslessly — written as *.bias F32 tensors, with "
+            f"nanity.use_bias=1 set — and any per-layer role a source model doesn't use (e.g. Qwen2 has "
+            f"attn q/k/v bias but no attn_output/ffn bias) is zero-filled, which is behaviorally identical "
+            f"to having no bias at all for that projection. This REQUIRES a runtime build with bias support "
+            f"(rawllm_common.hpp's engine::Config::use_bias, rawllm_loader.hpp's validate_config() bias "
+            f"checks, and rawllm_forward.hpp's bias-aware proj_all_positions[_multi]()) — an older bias-"
+            f"unaware runtime will silently ignore nanity.use_bias and produce wrong output with no error. "
+            f"Pass --force-bias-free / --drop-nonzero-bias-anyway to strip bias instead (lossy for any "
+            f"non-zero bias found) if you need a file compatible with an older runtime.")
 
     if cfg.has_qk_norm:
         blocking.append(
@@ -550,10 +558,14 @@ def resolve_config(cfg: InferredConfig, args) -> InferredConfig:
     return cfg
 
 
-def convert_layer(i: int, roles: dict, tensor_by_name: dict, cfg: InferredConfig, args) -> dict:
+def convert_layer(i: int, roles: dict, tensor_by_name: dict, cfg: InferredConfig, args,
+                   write_bias: bool) -> dict:
     def get(role):
         name, _shape, _dtype = roles[role]
         return dequant(tensor_by_name[name])
+
+    def get_opt(role):
+        return get(role) if role in roles else None
 
     if "attn_qkv" in roles:
         qkv = get("attn_qkv")
@@ -575,20 +587,40 @@ def convert_layer(i: int, roles: dict, tensor_by_name: dict, cfg: InferredConfig
     ffn_norm = get("ffn_norm")
     ffn_down = get("ffn_down")
 
-    # --- bias check: NANITY has no bias path at all ---
+    # --- bias: NANITY v1.1 has an opt-in bias path (nanity.use_bias). Zero-
+    # valued biases are always dropped for free (lossless either way). A
+    # non-zero bias is preserved by default now that the runtime supports
+    # it; --force-bias-free / --drop-nonzero-bias-anyway opts back into the
+    # old lossy drop-it behavior, e.g. for producing a file compatible with
+    # an older bias-unaware runtime build.
+    q_bias = k_bias = v_bias = o_bias = gate_bias = up_bias = down_bias = None
     for bias_role in BIAS_ROLES:
-        if bias_role in roles:
-            b = get(bias_role)
-            max_abs = float(np.abs(b).max())
-            if max_abs > 1e-6:
-                if not args.drop_nonzero_bias_anyway:
-                    sys.exit(
-                        f"layer {i}: {bias_role} is NON-ZERO (max abs={max_abs:.3g}). NANITY has no bias "
-                        f"term anywhere — dropping this changes the model's outputs, it is not a safe "
-                        f"relabeling. Re-run with --drop-nonzero-bias-anyway if that's acceptable."
-                    )
-                print(f"  ! layer {i}: dropping NON-ZERO {bias_role} (max abs={max_abs:.3g}) "
-                      f"— accuracy will be affected", file=sys.stderr)
+        if bias_role not in roles:
+            continue
+        b = get(bias_role)
+        max_abs = float(np.abs(b).max())
+        if max_abs > 1e-6 and args.force_bias_free:
+            print(f"  ! layer {i}: dropping NON-ZERO {bias_role} (max abs={max_abs:.3g}) "
+                  f"— accuracy will be affected", file=sys.stderr)
+            continue
+        if max_abs <= 1e-6:
+            continue  # zero bias: nothing to preserve, dropping it changes nothing
+        if bias_role == "attn_qkv_bias":
+            q_bias, k_bias, v_bias = split_rows(b, [cfg.q_dim, cfg.kv_dim, cfg.kv_dim])
+        elif bias_role == "attn_q_bias":
+            q_bias = b
+        elif bias_role == "attn_k_bias":
+            k_bias = b
+        elif bias_role == "attn_v_bias":
+            v_bias = b
+        elif bias_role == "attn_output_bias":
+            o_bias = b
+        elif bias_role == "ffn_gate_bias":
+            gate_bias = b
+        elif bias_role == "ffn_up_bias":
+            up_bias = b
+        elif bias_role == "ffn_down_bias":
+            down_bias = b
 
     # --- RoPE convention fix: full head_dim, adjacent-pair (cfg.rope_dim_count
     # was already resolved to cfg.head_dim above, with --force-full-rotary
@@ -596,11 +628,42 @@ def convert_layer(i: int, roles: dict, tensor_by_name: dict, cfg: InferredConfig
     q = permute_qk_rows_per_head(q, cfg.n_head, cfg.head_dim, cfg.rope_dim_count)
     k = permute_qk_rows_per_head(k, cfg.n_kv_head, cfg.head_dim, cfg.rope_dim_count)
 
+    # q_bias/k_bias are one value per OUTPUT channel — same row indexing as
+    # the weight matrices above — so they need the identical permutation to
+    # stay consistent with the permuted weight rows they belong to. A 1-D
+    # bias reshapes as (n_heads, head_dim) instead of (n_heads, head_dim,
+    # out_features); permute_qk_rows_per_head expects a 2-D [rows, cols]
+    # array, so we add a trailing axis and drop it again afterward rather
+    # than duplicating the permutation logic for the 1-D case.
+    if write_bias:
+        if q_bias is not None:
+            q_bias = permute_qk_rows_per_head(q_bias[:, None], cfg.n_head, cfg.head_dim,
+                                               cfg.rope_dim_count)[:, 0]
+        if k_bias is not None:
+            k_bias = permute_qk_rows_per_head(k_bias[:, None], cfg.n_kv_head, cfg.head_dim,
+                                               cfg.rope_dim_count)[:, 0]
+
+        # Zero-fill any role this layer doesn't use, so every layer has all
+        # 7 bias vectors once nanity.use_bias=1 is set globally — the
+        # runtime's validate_config() requires uniform presence across
+        # layers when the flag is on, and an all-zero bias is behaviorally
+        # identical to no bias for that projection (e.g. Qwen2: q/k/v have
+        # real bias, attn_output/ffn never do — those become zero vectors).
+        if q_bias is None:    q_bias    = np.zeros(cfg.q_dim,  dtype=np.float32)
+        if k_bias is None:    k_bias    = np.zeros(cfg.kv_dim, dtype=np.float32)
+        if v_bias is None:    v_bias    = np.zeros(cfg.kv_dim, dtype=np.float32)
+        if o_bias is None:    o_bias    = np.zeros(cfg.n_embd, dtype=np.float32)
+        if gate_bias is None: gate_bias = np.zeros(cfg.n_ff,   dtype=np.float32)
+        if up_bias is None:   up_bias   = np.zeros(cfg.n_ff,   dtype=np.float32)
+        if down_bias is None: down_bias = np.zeros(cfg.n_embd, dtype=np.float32)
+
     return dict(attn_norm=attn_norm, q=q, k=k, v=v, attn_out=attn_out,
-                ffn_norm=ffn_norm, gate=gate, up=up, ffn_down=ffn_down)
+                ffn_norm=ffn_norm, gate=gate, up=up, ffn_down=ffn_down,
+                q_bias=q_bias, k_bias=k_bias, v_bias=v_bias, o_bias=o_bias,
+                gate_bias=gate_bias, up_bias=up_bias, down_bias=down_bias)
 
 
-def verify_output(path: str, expect: InferredConfig) -> bool:
+def verify_output(path: str, expect: InferredConfig, bias_written: bool) -> bool:
     reader = gguf.GGUFReader(path)
     meta = read_all_metadata(reader)
     ok = True
@@ -627,7 +690,18 @@ def verify_output(path: str, expect: InferredConfig) -> bool:
             check(f"blk.{i}.{suffix}" in names, f"missing blk.{i}.{suffix}")
     check("token_embd.weight" in names, "missing token_embd.weight")
     check("output_norm.weight" in names, "missing output_norm.weight")
-    check(not any(n.endswith(".bias") for n in names), "found a .bias tensor (NANITY forbids these)")
+
+    if bias_written:
+        check(meta.get("nanity.use_bias") in (1, True), "nanity.use_bias not set to true")
+        for i in range(expect.n_layer):
+            for suffix in ["attn_q.bias", "attn_k.bias", "attn_v.bias", "attn_output.bias",
+                           "ffn_gate.bias", "ffn_up.bias", "ffn_down.bias"]:
+                check(f"blk.{i}.{suffix}" in names, f"missing blk.{i}.{suffix} (nanity.use_bias=1)")
+    else:
+        check("nanity.use_bias" not in meta or not meta.get("nanity.use_bias"),
+              "nanity.use_bias set but no bias was written")
+        check(not any(n.endswith(".bias") for n in names),
+              "found a .bias tensor but bias_written=False — inconsistent output")
 
     return ok
 
@@ -655,8 +729,13 @@ def main():
                           "the full head_dim, which NANITY v1 always does — but corrupts the tail channels "
                           "the source model never trained as position-dependent. Accuracy-losing; validate "
                           "output afterward. See header docstring.")
-    ap.add_argument("--drop-nonzero-bias-anyway", action="store_true",
-                     help="accept the accuracy loss of dropping a non-zero bias tensor")
+    ap.add_argument("--force-bias-free", "--drop-nonzero-bias-anyway", dest="force_bias_free",
+                     action="store_true",
+                     help="write a spec-v1, bias-free file even if the source model has non-zero bias "
+                          "tensors — drops them (lossy). Default is now to PRESERVE bias losslessly as "
+                          "*.bias tensors + nanity.use_bias=1, since the runtime supports it; use this "
+                          "flag only if you need a file compatible with an older bias-unaware runtime "
+                          "build. (--drop-nonzero-bias-anyway is kept as an alias for older scripts.)")
     ap.add_argument("--drop-qk-norm-anyway", action="store_true",
                      help="accept the accuracy loss of dropping attn_q_norm/attn_k_norm (Qwen3/Gemma2-style)")
     ap.add_argument("--n-head", type=int, default=None)
@@ -691,6 +770,15 @@ def main():
         return
 
     cfg = resolve_config(cfg, args)  # this is where --force-full-rotary gets enforced/checked
+
+    # Whether to preserve bias as *.bias tensors + nanity.use_bias=1. Default
+    # is yes whenever the source has any bias at all (lossless now that the
+    # runtime supports it) -- --force-bias-free opts back into the old
+    # bias-free-only behavior.
+    write_bias = cfg.has_any_bias and not args.force_bias_free
+    if cfg.has_any_bias and args.force_bias_free:
+        print("  ! --force-bias-free set: any non-zero bias tensors found will be dropped "
+              "(lossy) so the output stays spec-v1 bias-free.", file=sys.stderr)
 
     print(f"[2/5] config: n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_head={cfg.n_head} "
           f"n_kv_head={cfg.n_kv_head} head_dim={cfg.head_dim} n_ff={cfg.n_ff} vocab={cfg.n_vocab}")
@@ -740,6 +828,8 @@ def main():
     writer.add_float32("nanity.rope.freq_base", cfg.rope_freq_base)
     writer.add_float32("nanity.rope.scale_linear", args.rope_scale_linear)
     writer.add_uint32("nanity.vocab_size", cfg.n_vocab)
+    if write_bias:
+        writer.add_bool("nanity.use_bias", True)
     if args.name:
         writer.add_string("general.name", args.name)
     elif "general.name" in meta:
@@ -779,10 +869,23 @@ def main():
         add_weight("output.weight", output_w)
         del output_w
 
+        # output.bias only makes sense for an untied output (tied embeddings
+        # have no separate output projection to attach a bias to) -- matches
+        # ModelWeights::build()'s "if (mw.output) mw.output_bias = ..." in
+        # rawllm_forward.hpp. Zero-fill if the source didn't have one but
+        # nanity.use_bias=1 is set globally, same reasoning as per-layer bias.
+        if write_bias:
+            if "output_bias" in globals_:
+                output_bias = dequant(tensor_by_name[globals_["output_bias"][0]])
+            else:
+                output_bias = np.zeros(cfg.n_vocab, dtype=np.float32)
+            add_norm("output.bias", output_bias)
+            del output_bias
+
     print(f"[4/5] converting + writing {cfg.n_layer} layers "
           f"(split fused tensors, fix RoPE convention, drop/validate bias) ...")
     for i in sorted(layers.keys()):
-        layer_data = convert_layer(i, layers[i].roles, tensor_by_name, cfg, args)
+        layer_data = convert_layer(i, layers[i].roles, tensor_by_name, cfg, args, write_bias)
 
         add_norm(f"blk.{i}.attn_norm.weight", layer_data["attn_norm"])
         add_weight(f"blk.{i}.attn_q.weight", layer_data["q"])
@@ -793,6 +896,19 @@ def main():
         add_weight(f"blk.{i}.ffn_gate.weight", layer_data["gate"])
         add_weight(f"blk.{i}.ffn_up.weight", layer_data["up"])
         add_weight(f"blk.{i}.ffn_down.weight", layer_data["ffn_down"])
+
+        if write_bias:
+            # Bias vectors are written F32, not quantized -- rawllm_forward.hpp's
+            # ModelWeights::find_bias() reinterpret_casts the raw tensor bytes
+            # straight to const float* with no dequant step, so anything other
+            # than F32 here would be silently misread on the runtime side.
+            add_norm(f"blk.{i}.attn_q.bias", layer_data["q_bias"])
+            add_norm(f"blk.{i}.attn_k.bias", layer_data["k_bias"])
+            add_norm(f"blk.{i}.attn_v.bias", layer_data["v_bias"])
+            add_norm(f"blk.{i}.attn_output.bias", layer_data["o_bias"])
+            add_norm(f"blk.{i}.ffn_gate.bias", layer_data["gate_bias"])
+            add_norm(f"blk.{i}.ffn_up.bias", layer_data["up_bias"])
+            add_norm(f"blk.{i}.ffn_down.bias", layer_data["down_bias"])
 
         del layer_data
         print(f"  layer {i + 1}/{cfg.n_layer} done", end="\r", flush=True)
@@ -807,7 +923,7 @@ def main():
     print(f"  wrote {len(quant_report)} tensors, {out_size / 1e6:.1f} MB total")
 
     print(f"[5/5] verifying {args.output_gguf} against NANITY §3/§4 ...")
-    if verify_output(args.output_gguf, cfg):
+    if verify_output(args.output_gguf, cfg, write_bias):
         print("  PASS — file is NANITY v1 conformant.")
     else:
         print("  FAIL — see above. Do not ship this file.", file=sys.stderr)
