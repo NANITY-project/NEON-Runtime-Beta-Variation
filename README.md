@@ -42,9 +42,49 @@ full "why" and the exact tensor/metadata contract.
   QKV biases) need `nanity_convert.py --drop-nonzero-bias-anyway`, which
   is genuinely lossy — expect degraded output, not a faithful conversion,
   for those specific models. This is a spec limitation, not a runtime bug.
-- **Vulkan backend**: not started. CPU and ROCm (`rawllm_rocm.hpp`) exist
-  today. (The vulkan file is purely experimental)
+- **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
+  gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
+  descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
+  against a software Vulkan implementation (Mesa lavapipe) across a range of
+  matrix sizes including realistic transformer-layer dimensions — but **not
+  yet exercised on real GPU hardware**, and **not wired into the actual
+  generation hot path**: `--model ... --probe` with a Vulkan-enabled build
+  will initialize the backend and log whether a usable device was found,
+  but every token is still computed on the CPU path
+  (`rawllm_simd_dispatch.hpp`) regardless. Only F32 weights are covered;
+  quantized (Q4_0/Q8_0/K-quant) tensors would need a per-row dequant step
+  before this shader could touch them, which is real added cost the
+  CPU-side fused int8 kernels don't pay — deciding when that trade-off is
+  worth it, and actually routing `proj_all_positions()` through the GPU for
+  it, is the next piece of work here, not something this header claims to
+  do yet.
 - Single-operator, no independent security audit yet (see `License`).
+
+## CPU SIMD backends
+
+`rawllm_forward.hpp`'s dot-product / fused-quantized-dot kernels are split
+into their own headers so a specific ISA backend can be built, read, or
+benchmarked in isolation instead of hunting through the forward pass:
+
+- `rawllm_simd_scalar.hpp` — portable fallback, always available, and the
+  correctness reference every vectorized backend is checked against.
+- `rawllm_simd_avx2.hpp` — AVX2+FMA kernels (auto-selected whenever the
+  build already has `__AVX2__`, e.g. via `-mavx2 -mfma`).
+- `rawllm_simd_avx512.hpp` — AVX-512 kernels, with an `AVX512-VNNI` fast
+  path (`_mm512_dpbusd_epi32`) when the build also has `-mavx512vnni`.
+  Opt-in via `-DUSE_AVX512` (see below) — AVX-512 is never auto-selected,
+  since a build box having it doesn't guarantee every machine the binary
+  runs on does too.
+- `rawllm_simd_dispatch.hpp` — picks AVX-512 > AVX2 > scalar at compile
+  time and exposes the winner as `simd::dot_f32` / `simd::axpy_f32` /
+  `simd::dot_q4_0_q8_0` / `simd::dot_q8_0_q8_0`; this is the only one of
+  the four `rawllm_forward.hpp` actually includes.
+
+Build any translation unit that includes `rawllm_simd_dispatch.hpp` with
+`-DRAWLLM_SIMD_SELFTEST` to get `simd::run_selftest()`, which checks
+whichever backend got selected against the scalar reference over
+randomized Q4_0/Q8_0 blocks and plain dot/axpy inputs — a development/CI
+aid, not compiled in by default.
 
 ## Build
 
@@ -52,12 +92,27 @@ CPU-only (no GPU needed):
 ```
 g++ -std=c++20 -O2 -pthread NEON-3.cpp -o neon
 ```
+AVX2 (auto-detected from the compiler flag, no extra `-D` needed):
+```
+g++ -std=c++20 -O2 -pthread -mavx2 -mfma NEON-3.cpp -o neon
+```
+AVX-512 (opt-in; add `-mavx512bw -mavx512vnni` for the widened int8 path):
+```
+g++ -std=c++20 -O2 -pthread -mavx512f -mavx512bw -mavx512vnni -DUSE_AVX512 NEON-3.cpp -o neon
+```
 With the optional idle-loop features:
 ```
 g++ -std=c++20 -O2 -pthread -DNANITY_ENABLE_IDLE_LOOP NEON-3.cpp -o neon
 ```
 ROCm build: see `rawllm_rocm.hpp` (gated behind `__HIP_PLATFORM_AMD__`/
 `USE_ROCM`; not required for CPU inference).
+
+Vulkan build (experimental, see above — needs the Vulkan SDK loader/headers
+and a compiled shader):
+```
+glslangValidator -V shaders/matvec_f32.comp -o shaders/matvec_f32.spv
+g++ -std=c++20 -O2 -pthread -DUSE_VULKAN NEON-3.cpp -lvulkan -o neon
+```
 
 ## Quick start
 
