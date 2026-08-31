@@ -42,6 +42,8 @@ full "why" and the exact tensor/metadata contract.
   QKV biases) need `nanity_convert.py --drop-nonzero-bias-anyway`, which
   is genuinely lossy — expect degraded output, not a faithful conversion,
   for those specific models. This is a spec limitation, not a runtime bug.
+  However,experimental bias has been added. But tests do not seem to be working.
+  Release V0.2 is supposed to include both Bias tensors support and mature vulkan backend.
 - **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
   gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
   descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
