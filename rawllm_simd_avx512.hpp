@@ -117,6 +117,47 @@ inline int32_t sum_i8_64(const int8_t* x64) {
     __m512i sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, x);
     return _mm512_reduce_add_epi32(sum32);
 }
+
+// Per-block VNNI Q8_0 dot, 256-bit width (_mm256_dpbusd_epi32 — VNNI
+// isn't only a 512-bit instruction; AVX-512VL exposes 128/256-bit forms
+// too). This supersedes an earlier attempt at pairing two blocks into one
+// 512-bit dpbusd_biased() call: that required staging the two blocks'
+// int8 payloads into a contiguous 64-byte scratch buffer first (Q8_0's
+// on-disk layout interleaves a 2-byte fp16 scale between every 32-byte
+// payload, so blk1's payload isn't adjacent to blk0's), and the resulting
+// store-then-immediately-reload created a store-forwarding stall that
+// measured ~4x SLOWER end to end than the plain AVX-512F path despite the
+// VNNI math itself being cheap in isolation. Operating on one block at a
+// time at 256-bit width needs no staging (each block's 32-byte payload is
+// read directly via loadu).
+//
+// Takes the block's activation sum as a precomputed scalar (sum_x) rather
+// than computing it here via a second dpbusd — that second pass was the
+// other thing eating the VNNI path's advantage: measured back-to-back
+// against the AVX-512F widen+madd path, computing xsum in-kernel made
+// this ~15% SLOWER despite doing "the same amount of work" on paper,
+// because it's a second full load+dpbusd+reduce dependency chain per
+// block on top of the first. sum_x depends only on the activation block —
+// identical across every weight row that block gets dotted against — so
+// having quantize_rows_q8_0() compute it once (as a free byproduct of the
+// pass it already makes over those same 32 elements for the scale) and
+// passing it in turns this into one dpbusd + one reduce + one scalar
+// subtract, no second vector pass at all.
+inline int32_t block_isum_q8_0_vnni(const int8_t* w32, const int8_t* xq, int32_t sum_x) {
+    __m256i w_raw = _mm256_loadu_si256((const __m256i*)w32);
+    __m256i x_raw = _mm256_loadu_si256((const __m256i*)xq);
+    __m256i bias  = _mm256_set1_epi8((char)0x80);
+    __m256i w_u   = _mm256_xor_si256(w_raw, bias);
+    __m256i prod  = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_u, x_raw);
+
+    __m128i lo = _mm256_castsi256_si128(prod);
+    __m128i hi = _mm256_extracti128_si256(prod, 1);
+    __m128i sum4 = _mm_add_epi32(lo, hi);
+    __m128i sh1  = _mm_add_epi32(sum4, _mm_unpackhi_epi64(sum4, sum4));
+    __m128i sh2  = _mm_add_epi32(sh1, _mm_shuffle_epi32(sh1, 0x1));
+    int32_t uncentered = _mm_cvtsi128_si32(sh2);
+    return uncentered - 128 * sum_x;
+}
 #endif // __AVX512VNNI__
 
 } // namespace avx512
