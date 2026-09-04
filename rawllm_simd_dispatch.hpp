@@ -66,7 +66,8 @@ inline void axpy_f32(float* out, float w, const float* v, size_t n) {
 // scale + 16 packed-nibble bytes) against one Q8_0-quantized activation row
 // (see quantize_rows_q8_0() in rawllm_forward.hpp — internal scratch format,
 // not the on-disk GGUF Q8_0 layout).
-inline float dot_q4_0_q8_0(const uint8_t* w, const float* x_d, const int8_t* x_q, size_t cols) {
+inline float dot_q4_0_q8_0(const uint8_t* w, const float* x_d, const int32_t* x_sum,
+                            const int8_t* x_q, size_t cols) {
     size_t nb = cols / 32;
     float total = 0.f;
     for (size_t b = 0; b < nb; ++b) {
@@ -96,8 +97,15 @@ inline float dot_q4_0_q8_0(const uint8_t* w, const float* x_d, const int8_t* x_q
 
         const uint8_t* qs = blk + 2;
         const int8_t*  xq = x_q + b * 32;
-        int32_t sum_x = 0;
-        for (int j = 0; j < 32; ++j) sum_x += xq[j];
+        // FIX (perf): this used to be `int32_t sum_x = 0; for (j) sum_x +=
+        // xq[j];` — recomputed from scratch on EVERY call, i.e. once per
+        // (output row, block) pair. sum_x only depends on the activation
+        // block, which is the same for every output row of a projection
+        // (thousands of rows share it), so it was being redundantly
+        // recomputed thousands of times over. quantize_rows_q8_0() now
+        // computes it once, as a byproduct of the pass it already makes
+        // over the same elements to find amax/scale, and passes it in.
+        int32_t sum_x = x_sum[b];
 #if defined(RAWLLM_AVX512)
         int32_t uncentered = avx512::block_isum_q4_0(qs, xq);
 #elif defined(RAWLLM_AVX2)
@@ -118,40 +126,49 @@ inline float dot_q4_0_q8_0(const uint8_t* w, const float* x_d, const int8_t* x_q
 // Q4_0, there's no dequant possible to skip on the WEIGHT side (it's already
 // int8), so this is a strict win over dequantize_row()+dot_f32(): no float
 // materialization at all, straight int8 dot + one scale multiply per block.
-inline float dot_q8_0_q8_0(const uint8_t* w, const float* x_d, const int8_t* x_q, size_t cols) {
+// fp16->fp32 for a Q8_0 block header (34-byte stride: 2-byte scale + 32
+// signed int8 values). Pulled out so the VNNI-paired path below and the
+// per-block fallback path can share it without duplicating the bit trick.
+inline float q8_0_block_scale(const uint8_t* blk) {
+    uint16_t dh; std::memcpy(&dh, blk, 2);
+    uint32_t sign = (dh & 0x8000u) << 16;
+    uint32_t exp  = (dh >> 10) & 0x1F;
+    uint32_t mant = dh & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;
+        else {
+            exp = 1;
+            while (!(mant & 0x400)) { mant <<= 1; --exp; }
+            mant &= 0x3FF;
+            bits = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    float wd; std::memcpy(&wd, &bits, 4);
+    return wd;
+}
+
+inline float dot_q8_0_q8_0(const uint8_t* w, const float* x_d, const int32_t* x_sum,
+                            const int8_t* x_q, size_t cols) {
     size_t nb = cols / 32;
     float total = 0.f;
     for (size_t b = 0; b < nb; ++b) {
         const uint8_t* blk = w + b * 34;
-        uint16_t dh; std::memcpy(&dh, blk, 2);
-        uint32_t sign = (dh & 0x8000u) << 16;
-        uint32_t exp  = (dh >> 10) & 0x1F;
-        uint32_t mant = dh & 0x3FF;
-        uint32_t bits;
-        if (exp == 0) {
-            if (mant == 0) bits = sign;
-            else {
-                exp = 1;
-                while (!(mant & 0x400)) { mant <<= 1; --exp; }
-                mant &= 0x3FF;
-                bits = sign | ((exp + 112) << 23) | (mant << 13);
-            }
-        } else if (exp == 0x1F) {
-            bits = sign | 0x7F800000u | (mant << 13);
-        } else {
-            bits = sign | ((exp + 112) << 23) | (mant << 13);
-        }
-        float wd; std::memcpy(&wd, &bits, 4);
-
+        float wd = q8_0_block_scale(blk);
         const int8_t* wq = reinterpret_cast<const int8_t*>(blk + 2);
         const int8_t* xq = x_q + b * 32;
 #if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
-        // VNNI dpbusd works on 64-byte (two-block) spans; since this loop
-        // is per-block, use the portable AVX-512F widen path here and let
-        // a future pairwise-block refactor pick up VNNI (documented, not
-        // done — see rawllm_simd_avx512.hpp's dpbusd_biased() comment for
-        // why pairing blocks is what actually unlocks it).
-        int32_t isum = avx512::block_isum_q8_0_f(wq, xq);
+        // Only the VNNI path needs x_sum: it XORs the weight bytes to
+        // unsigned so dpbusd (which requires an unsigned first operand)
+        // can be used at all, which means it needs the same -128*sum_x
+        // bias correction Q4_0 needs. The AVX-512F/AVX2/scalar widen paths
+        // below sign-extend both operands directly and never introduce
+        // that offset, so they have no use for x_sum.
+        int32_t isum = avx512::block_isum_q8_0_vnni(wq, xq, x_sum[b]);
 #elif defined(RAWLLM_AVX512)
         int32_t isum = avx512::block_isum_q8_0_f(wq, xq);
 #elif defined(RAWLLM_AVX2)
@@ -236,6 +253,113 @@ inline bool run_selftest() {
         if (refq8 != gotq8) {
             std::fprintf(stderr, "[simd selftest] block_isum_q8_0 mismatch trial=%d ref=%d got=%d\n", trial, refq8, gotq8);
             ok = false;
+        }
+
+#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
+        int32_t sum_x32 = 0;
+        for (auto v : xq32) sum_x32 += v;
+        int32_t vgot = avx512::block_isum_q8_0_vnni(w32, xq32, sum_x32);
+        if (refq8 != vgot) {
+            std::fprintf(stderr,
+                "[simd selftest] block_isum_q8_0_vnni mismatch trial=%d ref=%d got=%d\n",
+                trial, refq8, vgot);
+            ok = false;
+        }
+#endif
+    }
+
+#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
+    // Full dot_q8_0_q8_0() row test — catches layout bugs (per-block
+    // scale application, sum_x indexing) that the isolated primitive test
+    // above can't see.
+    {
+        std::uniform_real_distribution<float> ddist(0.001f, 2.0f);
+        for (int trial = 0; trial < 500; ++trial) {
+            size_t nb = 1 + (rng() % 9);
+            size_t cols = nb * 32;
+            std::vector<uint8_t> wrow(nb * 34);
+            std::vector<float> x_d(nb);
+            std::vector<int32_t> x_sum(nb);
+            std::vector<int8_t> x_q(cols);
+            for (auto& v : wrow) v = (uint8_t)u8dist(rng);
+            for (auto& v : x_d)  v = ddist(rng);
+            for (auto& v : x_q)  v = (int8_t)i8dist(rng);
+            for (size_t b = 0; b < nb; ++b) {
+                int32_t s = 0;
+                for (size_t j = 0; j < 32; ++j) s += x_q[b * 32 + j];
+                x_sum[b] = s;
+            }
+
+            // Fix up each block's 2-byte header to a well-formed (non-NaN,
+            // non-subnormal-edge-case) fp16 so this is testing the dot
+            // math, not fp16 decode edge cases already covered elsewhere.
+            for (size_t b = 0; b < nb; ++b) {
+                uint16_t half = (uint16_t)(0x3C00 + (rng() % 0x400)); // ~[1,2)
+                std::memcpy(&wrow[b * 34], &half, 2);
+            }
+
+            float ref = 0.f;
+            for (size_t b = 0; b < nb; ++b) {
+                float wd = q8_0_block_scale(&wrow[b * 34]);
+                int32_t isum = scalar::block_isum_q8_0(
+                    reinterpret_cast<const int8_t*>(&wrow[b * 34 + 2]),
+                    &x_q[b * 32]);
+                ref += wd * x_d[b] * (float)isum;
+            }
+            float got = dot_q8_0_q8_0(wrow.data(), x_d.data(), x_sum.data(), x_q.data(), cols);
+            if (std::fabs(ref - got) > 1e-2f * std::max(1.0f, std::fabs(ref))) {
+                std::fprintf(stderr,
+                    "[simd selftest] dot_q8_0_q8_0 mismatch trial=%d nb=%zu ref=%f got=%f\n",
+                    trial, nb, ref, got);
+                ok = false;
+            }
+        }
+    }
+#endif
+
+    // dot_q4_0_q8_0() row test, all backends: this now sources sum_x from
+    // quantize_rows_q8_0()'s precomputed output instead of recomputing it
+    // inline (see the FIX comment at dot_q4_0_q8_0()'s definition), so
+    // this checks that plumbing end to end, not just the block kernel.
+    {
+        std::uniform_real_distribution<float> ddist(0.001f, 2.0f);
+        for (int trial = 0; trial < 500; ++trial) {
+            size_t nb = 1 + (rng() % 9);
+            size_t cols = nb * 32;
+            std::vector<uint8_t> wrow(nb * 18); // 2-byte scale + 16 packed bytes/block
+            std::vector<float> x_d(nb);
+            std::vector<int32_t> x_sum(nb);
+            std::vector<int8_t> x_q(cols);
+            for (auto& v : wrow) v = (uint8_t)u8dist(rng);
+            for (auto& v : x_d)  v = ddist(rng);
+            for (auto& v : x_q)  v = (int8_t)i8dist(rng);
+            for (size_t b = 0; b < nb; ++b) {
+                uint16_t half = (uint16_t)(0x3C00 + (rng() % 0x400));
+                std::memcpy(&wrow[b * 18], &half, 2);
+                int32_t s = 0;
+                for (size_t j = 0; j < 32; ++j) s += x_q[b * 32 + j];
+                x_sum[b] = s;
+            }
+
+            float ref = 0.f;
+            for (size_t b = 0; b < nb; ++b) {
+                uint16_t dh; std::memcpy(&dh, &wrow[b * 18], 2);
+                uint32_t sign = (dh & 0x8000u) << 16, exp = (dh >> 10) & 0x1F, mant = dh & 0x3FF, bits;
+                if (exp == 0) { bits = sign; }
+                else if (exp == 0x1F) { bits = sign | 0x7F800000u | (mant << 13); }
+                else { bits = sign | ((exp + 112) << 23) | (mant << 13); }
+                float wd; std::memcpy(&wd, &bits, 4);
+                int32_t uncentered = scalar::block_isum_q4_0(&wrow[b * 18 + 2], &x_q[b * 32]);
+                int32_t isum = uncentered - 8 * x_sum[b];
+                ref += wd * x_d[b] * (float)isum;
+            }
+            float got = dot_q4_0_q8_0(wrow.data(), x_d.data(), x_sum.data(), x_q.data(), cols);
+            if (std::fabs(ref - got) > 1e-2f * std::max(1.0f, std::fabs(ref))) {
+                std::fprintf(stderr,
+                    "[simd selftest] dot_q4_0_q8_0 mismatch trial=%d nb=%zu ref=%f got=%f\n",
+                    trial, nb, ref, got);
+                ok = false;
+            }
         }
     }
 
