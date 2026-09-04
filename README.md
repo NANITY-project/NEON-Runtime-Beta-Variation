@@ -10,7 +10,7 @@ spec itself — is designed around that one fixed shape on purpose. See
 [`NANITY_ARCHITECTURE_SPEC.md`](./NANITY_ARCHITECTURE_SPEC.md) for the
 full "why" and the exact tensor/metadata contract.
 
-> **Status: beta, source-available (not yet open source).** See
+> **Status: beta, source-available ** See
 > [`License`](./License) for current terms during the prototyping phase.
 
 ## What's actually working right now
@@ -172,7 +172,5 @@ in this repo is meant to be worked through hands-on, not studied first.
 
 ## License
 
-Source-available, restrictive terms during the current beta/prototyping
-phase — see [`License`](./License) for exactly what's currently permitted
-(download, local compile, testing, bug reports). Terms are expected to
-open up as the project matures.
+Source-available, - see [`License`](./License) for exactly what's currently permitted
+(download, local compile, testing, bug reports).
