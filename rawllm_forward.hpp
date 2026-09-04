@@ -87,6 +87,9 @@
 #include "rawllm_util.hpp"
 #include "rawllm_simd_dispatch.hpp"
 #include <iostream>  // for the VERBOSE_LOG std::cerr line below
+#include <mutex>
+#include <unordered_map>
+#include <memory>
 
 namespace fwd {
 
@@ -328,6 +331,157 @@ inline void dequant_full(const loader::TensorInfo& t, float* out) {
     dequantize_row(t.type, t.data_ptr, n, out);
 }
 
+// ─────────────────────────── GPU dispatch (ROCm) ─────────────────────────────
+// WIRING NOTE: rocm::GpuContext (rawllm_rocm.hpp) previously only got probed
+// for device count/logging (see NEON-3.cpp's USE_ROCM branch) — nothing in
+// the forward pass ever actually called into it, so every token ran on CPU
+// even with an MI300X sitting idle. rocm::matvec_rocblas() already existed
+// and works, but calling it as-is from here would be a net loss: it
+// re-uploads the ENTIRE weight matrix on every single call (see its
+// `tl_dW.up(W, rows*cols)` — there's no caching), and weights don't change
+// between tokens. Re-uploading e.g. a 4096x4096 f32 tensor (64MB) over
+// PCIe/Infinity Fabric on every token, for every projection in every layer,
+// would be far slower than just staying on the CPU int8 fast path above.
+//
+// gpu_weight_cache below fixes that: dequantize + upload each distinct
+// tensor (keyed by its stable data_ptr from the mmap'd/loaded model) to the
+// device exactly ONCE, the first time it's used, then every subsequent call
+// is a map lookup and reuses the resident device buffer — only the (tiny,
+// per-token) activation vector gets uploaded on the hot path.
+//
+// NOT compiled/tested on real hardware in this environment (no ROCm SDK or
+// AMD GPU available where this was written) — the CPU-side pieces (cache
+// bookkeeping, dequant scheduling, size threshold) follow the same patterns
+// already validated elsewhere in this file, but the actual rocBLAS/HIP call
+// sequence needs a real on-device run (build with -DUSE_ROCBLAS on the
+// MI300X box and diff a few logits against the CPU path) before trusting it
+// for real inference.
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+namespace gpu {
+
+// Mirrors dequantize_row()'s supported-type switch (rawllm_forward.hpp
+// above) — Q2_K/Q3_K/Q8_1/IQ4_NL aren't implemented there, so don't attempt
+// GPU dispatch for them either; let those tensors fall through to the
+// existing CPU path (which will throw the same clear "re-quantize with
+// llama.cpp" error dequantize_row() already gives, unchanged).
+inline bool gpu_dequant_supported(loader::GGMLType t) {
+    switch (t) {
+        case loader::GGMLType::F32:  case loader::GGMLType::F16:
+        case loader::GGMLType::BF16: case loader::GGMLType::Q8_0:
+        case loader::GGMLType::Q4_0: case loader::GGMLType::Q4_1:
+        case loader::GGMLType::Q5_0: case loader::GGMLType::Q5_1:
+        case loader::GGMLType::Q4_K: case loader::GGMLType::Q5_K:
+        case loader::GGMLType::Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Below this many output elements (rows*cols), the one-time dequant+upload
+// cost and per-call kernel-launch/sync overhead aren't worth it against the
+// already-fast CPU int8 path — small tensors (e.g. a handful of attention
+// output rows on a tiny model) stay on CPU even when a GPU is available.
+// Not benchmarked against real hardware; a conservative starting point
+// intended to be tuned once real timings exist.
+constexpr size_t GPU_DISPATCH_MIN_ELEMS = 4ull * 1024 * 1024; // e.g. 1024x4096
+
+struct CachedWeight {
+    rocm::DevBuf<float> dW;
+    size_t rows = 0, cols = 0;
+};
+
+inline std::mutex& cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<const void*, std::unique_ptr<CachedWeight>>& cache_map() {
+    static std::unordered_map<const void*, std::unique_ptr<CachedWeight>> m;
+    return m;
+}
+
+// Returns the resident device weight buffer for W, dequantizing (CPU,
+// thread-pooled, same dequantize_row() every other quant type already
+// goes through) and uploading exactly once per distinct tensor. Every call
+// after the first for a given tensor is just a locked map lookup.
+inline const rocm::DevBuf<float>* get_or_upload(const loader::TensorInfo& W,
+                                                  size_t rows, size_t cols,
+                                                  size_t row_bytes,
+                                                  util::ThreadPool& pool) {
+    {
+        std::lock_guard<std::mutex> lk(cache_mutex());
+        auto it = cache_map().find((const void*)W.data_ptr);
+        if (it != cache_map().end()) return &it->second->dW;
+    }
+
+    // Dequantize outside the lock — this is the expensive part (one pass
+    // over the whole tensor) and only ever runs once per tensor, but there
+    // is no reason to hold other threads' cache lookups hostage to it.
+    std::vector<float> host((size_t)rows * cols);
+    int nthreads = std::max(1, pool.size());
+    size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
+    bool any = false;
+    for (int ti = 0; ti < nthreads; ++ti) {
+        size_t r0 = (size_t)ti * row_chunk, r1 = std::min(rows, r0 + row_chunk);
+        if (r0 >= r1) continue;
+        any = true;
+        pool.submit([&W, &host, row_bytes, cols, r0, r1] {
+            for (size_t r = r0; r < r1; ++r)
+                dequantize_row(W.type, W.data_ptr + r * row_bytes,
+                                cols, host.data() + r * cols);
+        });
+    }
+    if (any) pool.wait();
+
+    auto cached = std::make_unique<CachedWeight>();
+    cached->rows = rows;
+    cached->cols = cols;
+    cached->dW.alloc(rows * cols);
+    cached->dW.up(host.data(), rows * cols);
+
+    std::lock_guard<std::mutex> lk(cache_mutex());
+    // Another thread may have raced us and already inserted this tensor
+    // while we were dequantizing/uploading; if so, keep theirs (first one
+    // in wins) and let ours free on scope exit rather than leaking a
+    // second device allocation for the same tensor.
+    auto& slot = cache_map()[(const void*)W.data_ptr];
+    if (!slot) slot = std::move(cached);
+    return &slot->dW;
+}
+
+// Runs the full projection (all `rows` output rows, all `seq` positions)
+// on GPU via one batched rocBLAS GEMM against the cached resident weight
+// buffer. X may not be contiguous (x_stride can exceed cols when X is a
+// view into a larger buffer), so it's packed into a small contiguous host
+// staging buffer before upload — cheap: seq*cols floats, not rows*cols.
+inline void proj_gpu(const loader::TensorInfo& W, const float* X, size_t x_stride,
+                      float* Y, size_t y_stride, size_t seq, size_t cols, size_t rows,
+                      size_t row_bytes, util::ThreadPool& pool) {
+    const rocm::DevBuf<float>* dW = get_or_upload(W, rows, cols, row_bytes, pool);
+
+    std::vector<float> x_packed((size_t)seq * cols);
+    for (size_t t = 0; t < seq; ++t)
+        std::memcpy(x_packed.data() + t * cols, X + t * x_stride, cols * sizeof(float));
+
+    thread_local rocm::DevBuf<float> dX, dOut;
+    rocm::maybe_resize(dX,   seq * cols);
+    rocm::maybe_resize(dOut, seq * rows);
+    dX.up(x_packed.data(), seq * cols);
+
+    rocm::rocblas_batched_gemm_f32((int)seq, (int)rows, (int)cols,
+                                    dX.ptr, dW->ptr, dOut.ptr);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    std::vector<float> y_packed((size_t)seq * rows);
+    dOut.dn(y_packed.data(), seq * rows);
+    for (size_t t = 0; t < seq; ++t)
+        for (size_t r = 0; r < rows; ++r)
+            Y[t * y_stride + r] = y_packed[t * rows + r];
+}
+
+} // namespace gpu
+#endif // USE_ROCBLAS && (__HIP_PLATFORM_AMD__ || USE_ROCM)
+
 // ───────────────────────── fused Q4_0 × Q8_0 dot product ────────────────────
 // FIX (perf): proj_all_positions[_multi]() used to dequantize every Q4_0
 // weight row into a full F32 rowbuf, THEN call dot_f32() against it — two
@@ -358,13 +512,21 @@ inline void dequant_full(const loader::TensorInfo& t, float* out) {
 // element block, laid out contiguously per row. Internal scratch format only
 // — this never touches disk or GGUF, so it doesn't need to match any
 // on-disk Q8_0 byte layout, just be self-consistent within this file.
+//
+// Also emits sum_out: the plain int32 sum of each block's 32 quantized
+// values. This exists purely so the fused dot kernels (dot_q4_0_q8_0,
+// and dot_q8_0_q8_0's VNNI path) don't have to recompute it — see the FIX
+// comment at their call sites below for why that recompute used to be a
+// real hot-path cost, not a rounding error.
 inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
-                                size_t seq, float* d_out, int8_t* q_out) {
+                                size_t seq, float* d_out, int8_t* q_out,
+                                int32_t* sum_out) {
     size_t nb = cols / 32;
     for (size_t t = 0; t < seq; ++t) {
         const float* x = X + t * x_stride;
         float*  d_row = d_out + t * nb;
         int8_t* q_row = q_out + t * cols;
+        int32_t* s_row = sum_out + t * nb;
         for (size_t b = 0; b < nb; ++b) {
             const float* xb = x + b * 32;
             float amax = 0.f;
@@ -373,10 +535,13 @@ inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
             float id = d > 0.f ? 1.0f / d : 0.f;
             d_row[b] = d;
             int8_t* qb = q_row + b * 32;
+            int32_t sum = 0;
             for (int j = 0; j < 32; ++j) {
                 int v = (int)std::lround(xb[j] * id);
                 qb[j] = (int8_t)std::clamp(v, -127, 127);
+                sum += qb[j];
             }
+            s_row[b] = sum;
         }
     }
 }
@@ -428,6 +593,20 @@ inline void proj_all_positions(const loader::TensorInfo& W,
             std::to_string(bs) + ") — can't dequantize safely.");
     size_t row_bytes = loader::GGUFLoader::bytes_for_type(W.type, cols);
 
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+    // GPU dispatch: previously nothing here ever routed through ROCm even
+    // when available (see the "WIRING NOTE" above gpu::proj_gpu) — every
+    // token ran on CPU regardless of hardware. Gate on availability, quant-
+    // type support, and a minimum size so small tensors (where dequant/
+    // upload/launch overhead would dominate) stay on the CPU path below.
+    if (rocm::GpuContext::get().available() &&
+        gpu::gpu_dequant_supported(W.type) &&
+        rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
+        gpu::proj_gpu(W, X, x_stride, Y, y_stride, seq, cols, rows, row_bytes, pool);
+        return;
+    }
+#endif
+
     int nthreads = std::max(1, pool.size());
 
     // Int8 fused fast path: quantize the (small) shared activation ONCE, up
@@ -441,16 +620,19 @@ inline void proj_all_positions(const loader::TensorInfo& W,
     // dequantize_row()+dot_f32() below unchanged.
     const bool use_q4_0_fast = (W.type == loader::GGMLType::Q4_0);
     const bool use_q8_0_fast = (W.type == loader::GGMLType::Q8_0);
-    thread_local std::vector<float>  q8_d;
-    thread_local std::vector<int8_t> q8_q;
+    thread_local std::vector<float>   q8_d;
+    thread_local std::vector<int8_t>  q8_q;
+    thread_local std::vector<int32_t> q8_sum;
     if (use_q4_0_fast || use_q8_0_fast) {
         size_t nb = cols / 32;
         if (q8_d.size() < seq * nb)   q8_d.resize(seq * nb);
         if (q8_q.size() < seq * cols) q8_q.resize(seq * cols);
-        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data());
+        if (q8_sum.size() < seq * nb) q8_sum.resize(seq * nb);
+        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
     }
-    const float*  q8_d_ptr = q8_d.data();
-    const int8_t* q8_q_ptr = q8_q.data();
+    const float*   q8_d_ptr   = q8_d.data();
+    const int8_t*  q8_q_ptr   = q8_q.data();
+    const int32_t* q8_sum_ptr = q8_sum.data();
 
     // FIX (perf): always parallelize across output ROWS, never across
     // positions. This used to branch on seq vs nthreads and, for seq >
@@ -475,13 +657,14 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (r0 >= r1) continue;
         any = true;
         pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
-                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr] {
+                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr] {
             size_t nb = cols / 32;
             if (use_q4_0_fast) {
                 for (size_t r = r0; r < r1; ++r) {
                     const uint8_t* row = W.data_ptr + r * row_bytes;
                     for (size_t t = 0; t < seq; ++t)
                         Y[t * y_stride + r] = dot_q4_0_q8_0(row, q8_d_ptr + t * nb,
+                                                             q8_sum_ptr + t * nb,
                                                              q8_q_ptr + t * cols, cols);
                 }
                 return;
@@ -491,6 +674,7 @@ inline void proj_all_positions(const loader::TensorInfo& W,
                     const uint8_t* row = W.data_ptr + r * row_bytes;
                     for (size_t t = 0; t < seq; ++t)
                         Y[t * y_stride + r] = dot_q8_0_q8_0(row, q8_d_ptr + t * nb,
+                                                             q8_sum_ptr + t * nb,
                                                              q8_q_ptr + t * cols, cols);
                 }
                 return;
@@ -541,6 +725,38 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                                       const float* X, size_t x_stride,
                                       size_t seq, util::ThreadPool& pool)
 {
+#if defined(USE_ROCBLAS) && (defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM))
+    // GPU dispatch: split off whichever targets are GPU-eligible and run
+    // each through proj_all_positions() (which now carries the same
+    // availability/type/size gating as the single-tensor call site above)
+    // so the GPU path logic lives in exactly one place. This gives up the
+    // chance to fuse e.g. Q+K+V into one batched GEMM across all three
+    // tensors at once — each goes to the GPU as its own call instead of
+    // one combined dispatch — in exchange for reusing already-wired logic
+    // instead of duplicating the GPU codepath here too. Worth revisiting
+    // once this is actually running on hardware and it's clear whether
+    // the per-call launch/sync overhead (three small syncs vs one) is
+    // significant next to the weight-cache-hit steady-state cost.
+    std::vector<ProjTarget> cpu_targets;
+    cpu_targets.reserve(targets.size());
+    bool gpu_available = rocm::GpuContext::get().available();
+    for (const auto& tg : targets) {
+        size_t cols = tg.W->shape.size() >= 2 ? (size_t)tg.W->shape[0] : 0;
+        size_t rows = tg.W->shape.size() >= 2 ? (size_t)tg.W->shape[1] : 0;
+        if (gpu_available && cols && rows &&
+            gpu::gpu_dequant_supported(tg.W->type) &&
+            rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
+            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool);
+        } else {
+            cpu_targets.push_back(tg);
+        }
+    }
+    if (cpu_targets.empty()) return;
+    const std::vector<ProjTarget>& targets_ref = cpu_targets;
+#else
+    const std::vector<ProjTarget>& targets_ref = targets;
+#endif
+
     enum class FastKind { None, Q4_0, Q8_0 };
     struct Span {
         const loader::TensorInfo* W;
@@ -549,7 +765,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         FastKind fast;
     };
     std::vector<Span> spans;
-    spans.reserve(targets.size());
+    spans.reserve(targets_ref.size());
     size_t total = 0;
     // All targets in a single call share the same X/x_stride (Q,K,V all read
     // the same normed input; gate,up read the same ff_normed input), but
@@ -562,7 +778,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
     // doesn't depend on the weight's quant type), so both kinds are folded
     // into the one "any_fast_cols" consistency check below.
     size_t any_fast_cols = 0;
-    for (const auto& tg : targets) {
+    for (const auto& tg : targets_ref) {
         if (tg.W->shape.size() < 2)
             throw std::runtime_error("forward(): expected a 2D weight tensor: " + tg.W->name);
         size_t cols = (size_t)tg.W->shape[0], rows = (size_t)tg.W->shape[1];
@@ -589,16 +805,19 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         total += rows;
     }
 
-    thread_local std::vector<float>  q8_d;
-    thread_local std::vector<int8_t> q8_q;
+    thread_local std::vector<float>   q8_d;
+    thread_local std::vector<int8_t>  q8_q;
+    thread_local std::vector<int32_t> q8_sum;
     if (any_fast_cols) {
         size_t nb = any_fast_cols / 32;
         if (q8_d.size() < seq * nb)             q8_d.resize(seq * nb);
         if (q8_q.size() < seq * any_fast_cols)  q8_q.resize(seq * any_fast_cols);
-        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data());
+        if (q8_sum.size() < seq * nb)           q8_sum.resize(seq * nb);
+        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
     }
-    const float*  q8_d_ptr = q8_d.data();
-    const int8_t* q8_q_ptr = q8_q.data();
+    const float*   q8_d_ptr   = q8_d.data();
+    const int8_t*  q8_q_ptr   = q8_q.data();
+    const int32_t* q8_sum_ptr = q8_sum.data();
 
     int nthreads = std::max(1, pool.size());
     size_t chunk = (total + (size_t)nthreads - 1) / (size_t)nthreads;
@@ -607,7 +826,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         size_t g0 = (size_t)ti * chunk, g1 = std::min(total, g0 + chunk);
         if (g0 >= g1) continue;
         any = true;
-        pool.submit([&spans, X, x_stride, seq, g0, g1, q8_d_ptr, q8_q_ptr] {
+        pool.submit([&spans, X, x_stride, seq, g0, g1, q8_d_ptr, q8_q_ptr, q8_sum_ptr] {
             thread_local std::vector<float> rowbuf;
             for (const auto& sp : spans) {
                 size_t lo = std::max(g0, sp.r0_global);
@@ -620,8 +839,10 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                         const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
                         for (size_t t = 0; t < seq; ++t)
                             sp.Y[t * sp.y_stride + r] = (sp.fast == FastKind::Q4_0)
-                                ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_q_ptr + t * sp.cols, sp.cols)
-                                : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_q_ptr + t * sp.cols, sp.cols);
+                                ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
+                                                q8_q_ptr + t * sp.cols, sp.cols)
+                                : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
+                                                q8_q_ptr + t * sp.cols, sp.cols);
                     }
                     continue;
                 }
