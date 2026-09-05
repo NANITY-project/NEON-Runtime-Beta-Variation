@@ -581,7 +581,8 @@ using simd::dot_q8_0_q8_0;
 inline void proj_all_positions(const loader::TensorInfo& W,
                                 const float* X, size_t x_stride,
                                 float* Y, size_t y_stride,
-                                size_t seq, util::ThreadPool& pool)
+                                size_t seq, util::ThreadPool& pool,
+                                const float* bias = nullptr)
 {
     if (W.shape.size() < 2)
         throw std::runtime_error("forward(): expected a 2D weight tensor: " + W.name);
@@ -603,6 +604,22 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         gpu::gpu_dequant_supported(W.type) &&
         rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
         gpu::proj_gpu(W, X, x_stride, Y, y_stride, seq, cols, rows, row_bytes, pool);
+        // FIX: the GPU path computes the raw matmul only -- proj_gpu()
+        // itself has no notion of bias, so it has to be added here on the
+        // CPU afterward, same as the CPU paths below. Bias is O(rows) work
+        // (one add per output element, not per weight element), so doing
+        // this on the host after the GEMM result is already downloaded
+        // costs nothing worth optimizing next to the GEMM itself, and it
+        // means proj_gpu()'s untested-on-real-hardware rocBLAS call
+        // sequence doesn't need to grow another responsibility to get
+        // bias support -- it stays exactly what it was benchmarked/reasoned
+        // about above, and bias is bolted on as a separate, trivially
+        // correct pass.
+        if (bias) {
+            for (size_t t = 0; t < seq; ++t)
+                for (size_t r = 0; r < rows; ++r)
+                    Y[t * y_stride + r] += bias[r];
+        }
         return;
     }
 #endif
@@ -657,25 +674,27 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (r0 >= r1) continue;
         any = true;
         pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
-                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr] {
+                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr, bias] {
             size_t nb = cols / 32;
             if (use_q4_0_fast) {
                 for (size_t r = r0; r < r1; ++r) {
                     const uint8_t* row = W.data_ptr + r * row_bytes;
+                    float b = bias ? bias[r] : 0.f;
                     for (size_t t = 0; t < seq; ++t)
                         Y[t * y_stride + r] = dot_q4_0_q8_0(row, q8_d_ptr + t * nb,
                                                              q8_sum_ptr + t * nb,
-                                                             q8_q_ptr + t * cols, cols);
+                                                             q8_q_ptr + t * cols, cols) + b;
                 }
                 return;
             }
             if (use_q8_0_fast) {
                 for (size_t r = r0; r < r1; ++r) {
                     const uint8_t* row = W.data_ptr + r * row_bytes;
+                    float b = bias ? bias[r] : 0.f;
                     for (size_t t = 0; t < seq; ++t)
                         Y[t * y_stride + r] = dot_q8_0_q8_0(row, q8_d_ptr + t * nb,
                                                              q8_sum_ptr + t * nb,
-                                                             q8_q_ptr + t * cols, cols);
+                                                             q8_q_ptr + t * cols, cols) + b;
                 }
                 return;
             }
@@ -690,9 +709,10 @@ inline void proj_all_positions(const loader::TensorInfo& W,
             if (rowbuf.size() < cols) rowbuf.resize(cols);
             for (size_t r = r0; r < r1; ++r) {
                 dequantize_row(W.type, W.data_ptr + r * row_bytes, cols, rowbuf.data());
+                float b = bias ? bias[r] : 0.f;
                 for (size_t t = 0; t < seq; ++t) {
                     const float* x = X + t * x_stride;
-                    Y[t * y_stride + r] = dot_f32(rowbuf.data(), x, cols);
+                    Y[t * y_stride + r] = dot_f32(rowbuf.data(), x, cols) + b;
                 }
             }
         });
@@ -719,6 +739,7 @@ struct ProjTarget {
     const loader::TensorInfo* W;
     float*                    Y;
     size_t                    y_stride;
+    const float*              bias = nullptr; // nullptr => no bias (spec-v1 behavior)
 };
 
 inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
@@ -746,7 +767,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         if (gpu_available && cols && rows &&
             gpu::gpu_dequant_supported(tg.W->type) &&
             rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
-            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool);
+            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool, tg.bias);
         } else {
             cpu_targets.push_back(tg);
         }
@@ -763,6 +784,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         size_t row_bytes, cols, y_stride, r0_global, r1_global;
         float* Y;
         FastKind fast;
+        const float* bias;
     };
     std::vector<Span> spans;
     spans.reserve(targets_ref.size());
@@ -801,7 +823,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                     "but not safe to assume in general.");
             any_fast_cols = cols;
         }
-        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast});
+        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast, tg.bias});
         total += rows;
     }
 
@@ -837,12 +859,13 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                     for (size_t g = lo; g < hi; ++g) {
                         size_t r = g - sp.r0_global;
                         const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
+                        float b = sp.bias ? sp.bias[r] : 0.f;
                         for (size_t t = 0; t < seq; ++t)
-                            sp.Y[t * sp.y_stride + r] = (sp.fast == FastKind::Q4_0)
+                            sp.Y[t * sp.y_stride + r] = ((sp.fast == FastKind::Q4_0)
                                 ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
                                                 q8_q_ptr + t * sp.cols, sp.cols)
                                 : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols);
+                                                q8_q_ptr + t * sp.cols, sp.cols)) + b;
                     }
                     continue;
                 }
@@ -850,9 +873,10 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                 for (size_t g = lo; g < hi; ++g) {
                     size_t r = g - sp.r0_global;
                     dequantize_row(sp.W->type, sp.W->data_ptr + r * sp.row_bytes, sp.cols, rowbuf.data());
+                    float b = sp.bias ? sp.bias[r] : 0.f;
                     for (size_t t = 0; t < seq; ++t) {
                         const float* x = X + t * x_stride;
-                        sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), x, sp.cols);
+                        sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), x, sp.cols) + b;
                     }
                 }
             }
@@ -961,12 +985,29 @@ struct LayerWeights {
     const loader::TensorInfo* ffn_gate  = nullptr;
     const loader::TensorInfo* ffn_up    = nullptr;
     const loader::TensorInfo* ffn_down  = nullptr;
+
+    // Bias vectors (nullptr when cfg.use_bias is false, which
+    // validate_config() already guarantees means these tensors don't exist
+    // in the file at all -- see engine::Config::use_bias). Stored as raw
+    // `const float*` rather than `const TensorInfo*` because F32 GGUF
+    // tensor data IS just a contiguous IEEE754 float array in the mmap'd
+    // file already -- there's no dequant step to defer, so resolving
+    // straight to the pointer once at load time keeps every call site
+    // below a plain nullable pointer instead of a second indirection.
+    const float* attn_q_bias      = nullptr;
+    const float* attn_k_bias      = nullptr;
+    const float* attn_v_bias      = nullptr;
+    const float* attn_out_bias    = nullptr;
+    const float* ffn_gate_bias    = nullptr;
+    const float* ffn_up_bias      = nullptr;
+    const float* ffn_down_bias    = nullptr;
 };
 
 struct ModelWeights {
     const loader::TensorInfo* token_embd  = nullptr;
     const loader::TensorInfo* output_norm = nullptr;
     const loader::TensorInfo* output      = nullptr; // null => tied to token_embd
+    const float*              output_bias = nullptr; // null when untied or use_bias=false
     std::vector<LayerWeights> layers;
 
     // Templated on Loader (GGUFLoader or NCTRLoader) rather than hardcoded —
@@ -979,12 +1020,23 @@ struct ModelWeights {
         return nullptr;
     }
 
+    // Resolves an optional bias tensor straight to its float data, or
+    // nullptr if absent. validate_config() has already enforced that
+    // presence/type/shape agree with cfg.use_bias before this ever runs,
+    // so this is a lookup, not a second validation pass.
+    template <typename Loader>
+    static const float* find_bias(const Loader& g, const std::string& name) {
+        const loader::TensorInfo* t = find_exact(g, name);
+        return t ? reinterpret_cast<const float*>(t->data_ptr) : nullptr;
+    }
+
     template <typename Loader>
     static ModelWeights build(const Loader& g, const engine::Config& cfg) {
         ModelWeights mw;
         mw.token_embd  = find_exact(g, "token_embd.weight");
         mw.output_norm = find_exact(g, "output_norm.weight");
         mw.output      = find_exact(g, "output.weight"); // optional: tied embeddings if absent
+        if (mw.output) mw.output_bias = find_bias(g, "output.bias");
 
         if (!mw.token_embd)  throw std::runtime_error("forward(): token_embd.weight not found");
         if (!mw.output_norm) throw std::runtime_error("forward(): output_norm.weight not found");
@@ -1002,6 +1054,16 @@ struct ModelWeights {
             L.ffn_gate  = find_exact(g, p + "ffn_gate.weight");
             L.ffn_up    = find_exact(g, p + "ffn_up.weight");
             L.ffn_down  = find_exact(g, p + "ffn_down.weight");
+
+            if (cfg.use_bias) {
+                L.attn_q_bias   = find_bias(g, p + "attn_q.bias");
+                L.attn_k_bias   = find_bias(g, p + "attn_k.bias");
+                L.attn_v_bias   = find_bias(g, p + "attn_v.bias");
+                L.attn_out_bias = find_bias(g, p + "attn_output.bias");
+                L.ffn_gate_bias = find_bias(g, p + "ffn_gate.bias");
+                L.ffn_up_bias   = find_bias(g, p + "ffn_up.bias");
+                L.ffn_down_bias = find_bias(g, p + "ffn_down.bias");
+            }
 
             if (!L.attn_norm || !L.attn_q || !L.attn_k || !L.attn_v || !L.attn_out ||
                 !L.ffn_norm  || (cfg.use_swiglu && !L.ffn_gate) || !L.ffn_up || !L.ffn_down) {
@@ -1221,9 +1283,9 @@ inline void transformer_forward(const engine::Config& cfg,
         // thread-pool round trip instead of three (see
         // proj_all_positions_multi()'s header comment).
         proj_all_positions_multi({
-            {L.attn_q, q.data(), q_dim},
-            {L.attn_k, k.data(), kv_dim},
-            {L.attn_v, v.data(), kv_dim},
+            {L.attn_q, q.data(), q_dim,  L.attn_q_bias},
+            {L.attn_k, k.data(), kv_dim, L.attn_k_bias},
+            {L.attn_v, v.data(), kv_dim, L.attn_v_bias},
         }, normed.data(), n_embd, seq, pool);
         stage_mark(us_proj);
 
@@ -1288,7 +1350,7 @@ inline void transformer_forward(const engine::Config& cfg,
         stage_mark(us_attn);
 
         // ── output projection + residual ───────────────────────────────
-        proj_all_positions(*L.attn_out, attn_out.data(), q_dim, proj_out.data(), n_embd, seq, pool);
+        proj_all_positions(*L.attn_out, attn_out.data(), q_dim, proj_out.data(), n_embd, seq, pool, L.attn_out_bias);
         stage_mark(us_proj);
         for (size_t i = 0; i < seq * n_embd; ++i) h[i] += proj_out[i];
         stage_mark(us_resid);
@@ -1316,18 +1378,18 @@ inline void transformer_forward(const engine::Config& cfg,
             // FIX (perf): same fusion as Q/K/V above — gate and up share
             // the same ff_normed input, one round trip instead of two.
             proj_all_positions_multi({
-                {L.ffn_gate, gate_buf.data(), n_ff},
-                {L.ffn_up,   up_buf.data(),   n_ff},
+                {L.ffn_gate, gate_buf.data(), n_ff, L.ffn_gate_bias},
+                {L.ffn_up,   up_buf.data(),   n_ff, L.ffn_up_bias},
             }, ff_normed.data(), n_embd, seq, pool);
             for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
         } else {
             // Plain SiLU-FFN: no gate projection — silu applied directly to up.
-            proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool);
+            proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool, L.ffn_up_bias);
             for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(up_buf[i]);
         }
         stage_mark(us_proj);
 
-        proj_all_positions(*L.ffn_down, ff_act.data(), n_ff, ff_down.data(), n_embd, seq, pool);
+        proj_all_positions(*L.ffn_down, ff_act.data(), n_ff, ff_down.data(), n_embd, seq, pool, L.ffn_down_bias);
         stage_mark(us_proj);
         for (size_t i = 0; i < seq * n_embd; ++i) h[i] += ff_down[i];
         stage_mark(us_resid);
@@ -1368,7 +1430,7 @@ inline void transformer_forward(const engine::Config& cfg,
     // directly as the output projection with no special-casing.
     // seq=1 here, so proj_all_positions takes the decode/row-parallel path.
     const loader::TensorInfo* out_w = mw.output ? mw.output : mw.token_embd;
-    proj_all_positions(*out_w, final_normed.data(), n_embd, out_logits, cfg.n_vocab, 1, pool);
+    proj_all_positions(*out_w, final_normed.data(), n_embd, out_logits, cfg.n_vocab, 1, pool, mw.output_bias);
 }
 
 } // namespace fwd
