@@ -11,7 +11,7 @@ spec itself — is designed around that one fixed shape on purpose. See
 full "why" and the exact tensor/metadata contract.
 
 > **Status: beta, source-available ** See
-> [`License`](./License) for current terms during the prototyping phase.
+> [`LICENSE`](./LICENSE) for current terms during the prototyping phase.
 
 ## What's actually working right now
 
@@ -37,13 +37,31 @@ full "why" and the exact tensor/metadata contract.
 
 ## Known limitations
 
-- **Bias terms aren't supported.** NANITY v1 has no bias tensors anywhere
-  in the spec. Models that rely on them (e.g. Qwen2's nonzero attention
-  QKV biases) need `nanity_convert.py --drop-nonzero-bias-anyway`, which
-  is genuinely lossy — expect degraded output, not a faithful conversion,
-  for those specific models. This is a spec limitation, not a runtime bug.
-  However,experimental bias has been added. But tests do not seem to be working.
-  Release V0.2 is supposed to include both Bias tensors support and mature vulkan backend.
+- **Bias support (spec-v1.1, opt-in via `nanity.use_bias`).** A file with
+  `nanity.use_bias=false` (or the key absent — every existing NANITY v1
+  file) is bias-free, byte-identical to before this was added. A file with
+  `nanity.use_bias=true` must carry a matching 1-D F32 `.bias` tensor
+  alongside every attn Q/K/V/O and FFN gate/up/down projection (plus
+  `output.bias` if the output projection is untied) — `validate_config()`
+  checks presence, dtype, and shape, and fails loudly (naming the exact
+  tensor) if the file's declared flag and its actual tensors disagree in
+  either direction.
+  Previously, `validate_config()` implemented this check, but
+  `rawllm_forward.hpp` never actually read or added a single bias tensor —
+  a converted-and-validated bias model would load successfully and then
+  silently run with every bias term dropped, which is why Qwen2 conversion
+  testing wasn't producing usable output. Fixed and verified end-to-end: a
+  synthetic GGUF file with `use_bias=true` and all-zero bias tensors now
+  produces output byte-identical to the same weights with no bias tensors
+  at all (max logit diff 0), and the same file with nonzero bias produces
+  clearly different output (max logit diff ~2, vs a ~1e-4 numerical-noise
+  floor) — confirming bias is actually read from the file and flows
+  through every projection (CPU dequant path, both fused Q4_0/Q8_0 int8
+  paths, and the ROCm GPU dispatch path below), not just validated and
+  discarded. `nanity_convert.py --drop-nonzero-bias-anyway` (lossy) is no
+  longer the only option for bias-having source models; a converter path
+  that preserves bias into `nanity.use_bias=true` output is the natural
+  follow-up, not done here.
 - **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
   gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
   descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
@@ -60,7 +78,17 @@ full "why" and the exact tensor/metadata contract.
   worth it, and actually routing `proj_all_positions()` through the GPU for
   it, is the next piece of work here, not something this header claims to
   do yet.
-- Single-operator, no independent security audit yet (see `License`).
+- **ROCm GPU dispatch** (`rawllm_forward.hpp`'s `gpu::` namespace, gated
+  behind `-DUSE_ROCBLAS` + `__HIP_PLATFORM_AMD__`/`USE_ROCM`): weight
+  tensors are dequantized and uploaded to the device once (keyed by the
+  tensor's stable mmap pointer) and reused across every subsequent token,
+  with per-projection GEMM dispatch above a size threshold so small
+  tensors stay on the CPU int8 fast path. **Not compiled/tested on real
+  ROCm hardware in the environment this was written in** — needs an
+  on-device run on an actual MI300X-class box (build with `-DUSE_ROCBLAS`
+  and diff a few logits against the CPU path) before trusting it for real
+  inference.
+- Single-operator, no independent security audit yet (see `LICENSE`).
 
 ## CPU SIMD backends
 
@@ -73,10 +101,16 @@ benchmarked in isolation instead of hunting through the forward pass:
 - `rawllm_simd_avx2.hpp` — AVX2+FMA kernels (auto-selected whenever the
   build already has `__AVX2__`, e.g. via `-mavx2 -mfma`).
 - `rawllm_simd_avx512.hpp` — AVX-512 kernels, with an `AVX512-VNNI` fast
-  path (`_mm512_dpbusd_epi32`) when the build also has `-mavx512vnni`.
-  Opt-in via `-DUSE_AVX512` (see below) — AVX-512 is never auto-selected,
-  since a build box having it doesn't guarantee every machine the binary
-  runs on does too.
+  path (`_mm256_dpbusd_epi32`, applied per 32-byte block) when the build
+  also has `-mavx512vnni` **and** `-mavx512vnni`'s prerequisite
+  `-mavx512vl` (VNNI's 256-bit instruction forms need VL to target
+  YMM registers — `-mavx512vnni` alone does not imply it, and previously
+  a `-mavx512vnni`-only build failed to compile entirely rather than
+  falling back; that's fixed, so that combination now degrades to the
+  plain AVX-512F path instead of failing the build). Opt-in via
+  `-DUSE_AVX512` (see below) — AVX-512 is never auto-selected, since a
+  build box having it doesn't guarantee every machine the binary runs on
+  does too.
 - `rawllm_simd_dispatch.hpp` — picks AVX-512 > AVX2 > scalar at compile
   time and exposes the winner as `simd::dot_f32` / `simd::axpy_f32` /
   `simd::dot_q4_0_q8_0` / `simd::dot_q8_0_q8_0`; this is the only one of
@@ -98,16 +132,23 @@ AVX2 (auto-detected from the compiler flag, no extra `-D` needed):
 ```
 g++ -std=c++20 -O2 -pthread -mavx2 -mfma NEON-3.cpp -o neon
 ```
-AVX-512 (opt-in; add `-mavx512bw -mavx512vnni` for the widened int8 path):
+AVX-512 (opt-in; add `-mavx512bw -mavx512vnni -mavx512vl` for the widened
+int8 path — `-mavx512vl` is required alongside `-mavx512vnni`, see above):
 ```
-g++ -std=c++20 -O2 -pthread -mavx512f -mavx512bw -mavx512vnni -DUSE_AVX512 NEON-3.cpp -o neon
+g++ -std=c++20 -O2 -pthread -mavx512f -mavx512bw -mavx512vnni -mavx512vl -DUSE_AVX512 NEON-3.cpp -o neon
 ```
 With the optional idle-loop features:
 ```
 g++ -std=c++20 -O2 -pthread -DNANITY_ENABLE_IDLE_LOOP NEON-3.cpp -o neon
 ```
-ROCm build: see `rawllm_rocm.hpp` (gated behind `__HIP_PLATFORM_AMD__`/
-`USE_ROCM`; not required for CPU inference).
+ROCm build (GPU dispatch — see the "ROCm GPU dispatch" note above; not
+required for CPU inference). Needs a HIP/ROCm toolchain (`hipcc`) and
+linking against `rocblas`/`amdhip64` — not compile-tested in this
+environment (no ROCm SDK available here), so the exact flags your ROCm
+install needs may differ from a generic example:
+```
+hipcc -std=c++20 -O2 -pthread -DUSE_ROCBLAS -DUSE_ROCM NEON-3.cpp -lrocblas -lamdhip64 -o neon
+```
 
 Vulkan build (experimental, see above — needs the Vulkan SDK loader/headers
 and a compiled shader):
@@ -172,5 +213,5 @@ in this repo is meant to be worked through hands-on, not studied first.
 
 ## License
 
-Source-available, - see [`License`](./License) for exactly what's currently permitted
+Source-available, - see [`LICENSE`](./LICENSE) for exactly what's currently permitted
 (download, local compile, testing, bug reports).
