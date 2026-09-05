@@ -161,7 +161,7 @@ inline float dot_q8_0_q8_0(const uint8_t* w, const float* x_d, const int32_t* x_
         float wd = q8_0_block_scale(blk);
         const int8_t* wq = reinterpret_cast<const int8_t*>(blk + 2);
         const int8_t* xq = x_q + b * 32;
-#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
+#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
         // Only the VNNI path needs x_sum: it XORs the weight bytes to
         // unsigned so dpbusd (which requires an unsigned first operand)
         // can be used at all, which means it needs the same -128*sum_x
@@ -255,7 +255,7 @@ inline bool run_selftest() {
             ok = false;
         }
 
-#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
+#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
         int32_t sum_x32 = 0;
         for (auto v : xq32) sum_x32 += v;
         int32_t vgot = avx512::block_isum_q8_0_vnni(w32, xq32, sum_x32);
@@ -268,7 +268,7 @@ inline bool run_selftest() {
 #endif
     }
 
-#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__)
+#if defined(RAWLLM_AVX512) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
     // Full dot_q8_0_q8_0() row test — catches layout bugs (per-block
     // scale application, sum_x indexing) that the isolated primitive test
     // above can't see.
