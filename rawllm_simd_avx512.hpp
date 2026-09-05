@@ -86,7 +86,21 @@ inline int32_t block_isum_q8_0_f(const int8_t* w, const int8_t* xq) {
     return _mm_cvtsi128_si32(sh2);
 }
 
-#if defined(__AVX512VNNI__)
+// FIX: block_isum_q8_0_vnni() below uses the 256-bit form of
+// _mm256_dpbusd_epi32, which needs AVX512VL in addition to AVX512VNNI
+// (VNNI's 512-bit form is native to the VNNI extension itself, but Intel's
+// ISA requires VL to expose 128/256-bit forms of AVX-512 instructions on
+// YMM/XMM registers) — `-mavx512vnni` alone does NOT imply `-mavx512vl`
+// (confirmed: gcc's predefined macros show __AVX512VNNI__ set without
+// __AVX512VL__ when only -mavx512vnni is passed), so a build with just
+// -mavx512vnni previously failed to compile entirely with "needs isa
+// option -mavxvnni -mavx512vnni -mavx512vl" pointing at this exact
+// function. Requiring both here means that combination now degrades
+// gracefully to the AVX-512F non-VNNI path below instead of failing the
+// whole build; real AVX512VNNI-capable hardware (Ice Lake / Cascade Lake
+// with VNNI, AMD Genoa and newer) ships AVX512VL as part of the same
+// baseline anyway, so this doesn't cost real hardware anything.
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 // VNNI fast path: _mm512_dpbusd_epi32 computes, per 32-bit lane, the sum of
 // four u8*i8 products accumulated directly into an existing int32 lane —
 // exactly the primitive int8 GEMM kernels are built around. It requires
@@ -158,7 +172,7 @@ inline int32_t block_isum_q8_0_vnni(const int8_t* w32, const int8_t* xq, int32_t
     int32_t uncentered = _mm_cvtsi128_si32(sh2);
     return uncentered - 128 * sum_x;
 }
-#endif // __AVX512VNNI__
+#endif // __AVX512VNNI__ && __AVX512VL__
 
 } // namespace avx512
 } // namespace simd
