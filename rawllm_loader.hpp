@@ -297,6 +297,28 @@ public:
                 throw std::runtime_error("NANITY: tensor '" + name + "' has shape " +
                     shape_str(sh) + ", expected [" + std::to_string(e0) + "].");
         };
+        // FIX: check1d only validates shape, not dtype. Every *.bias check
+        // below used to go through check1d directly, which means a bias
+        // tensor stored as anything other than F32 (e.g. accidentally
+        // quantized by a converter, or stored F16) would pass validation
+        // silently -- rawllm_forward.hpp's ModelWeights::find_bias()
+        // resolves bias tensors straight to `const float*` via
+        // reinterpret_cast on the raw mmap'd bytes (bias vectors are tiny
+        // and never worth quantizing, so this is deliberate, not an
+        // oversight) with no dequant step, so a non-F32 bias tensor would
+        // silently reinterpret garbage bytes as floats at inference time
+        // instead of failing loudly at load time where the problem is
+        // actually diagnosable.
+        auto check1d_bias = [&](const std::string& name, uint64_t e0) {
+            const auto& t = find_req(name);
+            if (t.type != GGMLType::F32)
+                throw std::runtime_error("NANITY: bias tensor '" + name + "' must be F32 "
+                    "(bias vectors are never quantized) -- found type " +
+                    std::to_string((uint32_t)t.type) + ".");
+            if (t.shape.size() != 1 || t.shape[0] != e0)
+                throw std::runtime_error("NANITY: tensor '" + name + "' has shape " +
+                    shape_str(t.shape) + ", expected [" + std::to_string(e0) + "].");
+        };
 
         // token_embd carries n_vocab -- the one model property the spec
         // doesn't pre-declare in metadata, since it's a property of the
@@ -332,7 +354,7 @@ public:
             // this file doesn't even look for output.bias if output.weight
             // is absent, matching ModelWeights::build()'s existing
             // "if (mw.output) mw.output_bias = ..." behavior in forward.hpp.
-            if (cfg.use_bias) check1d("output.bias", cfg.n_vocab);
+            if (cfg.use_bias) check1d_bias("output.bias", cfg.n_vocab);
         }
 
         for (uint32_t i = 0; i < cfg.n_layer; ++i) {
@@ -353,13 +375,13 @@ public:
             // use_bias but is missing/misshapes one of these fails here,
             // not three layers into a forward pass with silently-zero bias.
             if (cfg.use_bias) {
-                check1d(p + "attn_q.bias",      q_dim);
-                check1d(p + "attn_k.bias",      kv_dim);
-                check1d(p + "attn_v.bias",      kv_dim);
-                check1d(p + "attn_output.bias", cfg.n_embd);
-                check1d(p + "ffn_gate.bias",    cfg.n_ff);
-                check1d(p + "ffn_up.bias",      cfg.n_ff);
-                check1d(p + "ffn_down.bias",    cfg.n_embd);
+                check1d_bias(p + "attn_q.bias",      q_dim);
+                check1d_bias(p + "attn_k.bias",      kv_dim);
+                check1d_bias(p + "attn_v.bias",      kv_dim);
+                check1d_bias(p + "attn_output.bias", cfg.n_embd);
+                check1d_bias(p + "ffn_gate.bias",    cfg.n_ff);
+                check1d_bias(p + "ffn_up.bias",      cfg.n_ff);
+                check1d_bias(p + "ffn_down.bias",    cfg.n_embd);
             }
         }
 
