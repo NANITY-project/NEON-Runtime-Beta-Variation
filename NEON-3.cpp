@@ -688,7 +688,7 @@ static EngineState& get_engine_state(const engine::Config& cfg,
     // gracefully evict instead of the cache ever trying to be ctx_len long.
     static EngineState state{
         fwd::ModelWeights::build(gguf, cfg),
-        fwd::KVCache(cfg.n_layer, (size_t)cfg.n_kv_head * cfg.head_dim, cfg.kv_window),
+        fwd::KVCache(cfg.n_layer, (size_t)cfg.n_kv_head, (size_t)cfg.head_dim, cfg.kv_window),
         {}
     };
     return state;
