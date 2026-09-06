@@ -1,19 +1,22 @@
 #pragma once
 // =============================================================================
-// rawllm_simd_avx512.hpp — AVX-512 SIMD kernels, with an optional
-// AVX-512-VNNI fast path for the int8 block dot products.
+// rawllm_simd_avx512.hpp — AVX-512 SIMD kernels, with an AVX-512-VNNI fast
+// path for the int8 block dot products.
 //
-// Only compiled in when RAWLLM_AVX512 is defined (rawllm_common.hpp sets
-// this from __AVX512F__ && USE_AVX512). The VNNI path additionally requires
-// __AVX512VNNI__ (i.e. -mavx512vnni on the compile line) and is guarded
-// independently, so an AVX-512F-only build (no VNNI) still gets the
-// f32 dot/axpy speedup and falls back to a portable madd-based int8 path
-// for the quantized kernels.
+// PREVIOUSLY: gated behind `#if defined(RAWLLM_AVX512)` (whole-TU -mavx512f
+// requirement) with the VNNI section additionally requiring __AVX512VNNI__
+// at the TU level. Same per-target-binary problem as rawllm_simd_avx2.hpp —
+// see that file's header comment for the full rationale. NOW: every
+// function carries its own `__attribute__((target(...)))` and is always
+// compiled in, letting GCC/Clang's function-multiversioning resolver pick
+// the right one at runtime regardless of the TU's baseline -march. The
+// F-only functions are tagged with just avx512f/bw/vl; block_isum_q8_0_vnni
+// additionally requires avx512vnni in its target list, so the resolver only
+// ever selects it on hardware that actually has VNNI, falling back to
+// block_isum_q8_0_f (portable widen+madd) everywhere else with avx512f.
 // =============================================================================
 
 #include "rawllm_common.hpp"
-
-#if defined(RAWLLM_AVX512)
 #include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
@@ -21,6 +24,7 @@
 namespace simd {
 namespace avx512 {
 
+__attribute__((target("avx512f")))
 inline float dot_f32(const float* a, const float* b, size_t n) {
     __m512 acc = _mm512_setzero_ps();
     size_t i = 0;
@@ -31,6 +35,7 @@ inline float dot_f32(const float* a, const float* b, size_t n) {
     return sum;
 }
 
+__attribute__((target("avx512f")))
 inline void axpy_f32(float* out, float w, const float* v, size_t n) {
     __m512 vw = _mm512_set1_ps(w);
     size_t i = 0;
@@ -51,6 +56,7 @@ inline void axpy_f32(float* out, float w, const float* v, size_t n) {
 // and extra shuffle overhead for no benefit; AVX-512's actual win for this
 // kernel is in the caller's ability to pull two blocks per iteration
 // (see dispatch header), not in per-block width.
+__attribute__((target("avx512f,avx512bw,avx512vl")))
 inline int32_t block_isum_q4_0(const uint8_t* qs, const int8_t* xq) {
     __m128i raw  = _mm_loadu_si128((const __m128i*)qs);
     __m128i mask = _mm_set1_epi8(0x0F);
@@ -71,7 +77,9 @@ inline int32_t block_isum_q4_0(const uint8_t* qs, const int8_t* xq) {
 // Q8_0-vs-Q8_0 block (32 elements), portable AVX-512F path: same
 // widen-to-int16-then-madd approach as the AVX2 backend, just done in one
 // 256-bit widen instead of two 128-bit halves, since AVX-512F still gives
-// us _mm256_cvtepi8_epi16 for free. Used when VNNI isn't available.
+// us _mm256_cvtepi8_epi16 for free. Selected by the resolver when VNNI
+// isn't available on the running CPU (see block_isum_q8_0_vnni below).
+__attribute__((target("avx512f,avx512bw,avx512vl")))
 inline int32_t block_isum_q8_0_f(const int8_t* w, const int8_t* xq) {
     __m256i w32 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)w));
     __m256i x32 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)xq));
@@ -86,21 +94,6 @@ inline int32_t block_isum_q8_0_f(const int8_t* w, const int8_t* xq) {
     return _mm_cvtsi128_si32(sh2);
 }
 
-// FIX: block_isum_q8_0_vnni() below uses the 256-bit form of
-// _mm256_dpbusd_epi32, which needs AVX512VL in addition to AVX512VNNI
-// (VNNI's 512-bit form is native to the VNNI extension itself, but Intel's
-// ISA requires VL to expose 128/256-bit forms of AVX-512 instructions on
-// YMM/XMM registers) — `-mavx512vnni` alone does NOT imply `-mavx512vl`
-// (confirmed: gcc's predefined macros show __AVX512VNNI__ set without
-// __AVX512VL__ when only -mavx512vnni is passed), so a build with just
-// -mavx512vnni previously failed to compile entirely with "needs isa
-// option -mavxvnni -mavx512vnni -mavx512vl" pointing at this exact
-// function. Requiring both here means that combination now degrades
-// gracefully to the AVX-512F non-VNNI path below instead of failing the
-// whole build; real AVX512VNNI-capable hardware (Ice Lake / Cascade Lake
-// with VNNI, AMD Genoa and newer) ships AVX512VL as part of the same
-// baseline anyway, so this doesn't cost real hardware anything.
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 // VNNI fast path: _mm512_dpbusd_epi32 computes, per 32-bit lane, the sum of
 // four u8*i8 products accumulated directly into an existing int32 lane —
 // exactly the primitive int8 GEMM kernels are built around. It requires
@@ -112,6 +105,7 @@ inline int32_t block_isum_q8_0_f(const int8_t* w, const int8_t* xq) {
 // One 512-bit dpbusd call covers a full 64-byte span, i.e. two Q8_0 blocks
 // (32 elements each) at once — the caller (dispatch header) is the one
 // that takes advantage of that by pairing blocks.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 inline __m512i dpbusd_biased(const int8_t* w64, const int8_t* x64) {
     __m512i w_raw = _mm512_loadu_si512((const void*)w64);
     __m512i x_raw = _mm512_loadu_si512((const void*)x64);
@@ -123,6 +117,7 @@ inline __m512i dpbusd_biased(const int8_t* w64, const int8_t* x64) {
 // Sum of int8 activation lanes across a 64-byte span (needed for the
 // dpbusd bias correction above); done via madd against an all-ones int8
 // vector so it stays in integer domain and vectorizes the same way.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 inline int32_t sum_i8_64(const int8_t* x64) {
     __m512i x = _mm512_loadu_si512((const void*)x64);
     __m512i ones = _mm512_set1_epi8(1);
@@ -157,6 +152,12 @@ inline int32_t sum_i8_64(const int8_t* x64) {
 // pass it already makes over those same 32 elements for the scale) and
 // passing it in turns this into one dpbusd + one reduce + one scalar
 // subtract, no second vector pass at all.
+//
+// Target-attributed to require avx512vnni specifically (on top of
+// avx512f/bw/vl) — this is what lets the dispatch header's multiversioned
+// dot_q8_0_q8_0 resolver prefer this over block_isum_q8_0_f automatically
+// on CPUs that have VNNI, without any manual __AVX512VNNI__ check.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 inline int32_t block_isum_q8_0_vnni(const int8_t* w32, const int8_t* xq, int32_t sum_x) {
     __m256i w_raw = _mm256_loadu_si256((const __m256i*)w32);
     __m256i x_raw = _mm256_loadu_si256((const __m256i*)xq);
@@ -172,9 +173,6 @@ inline int32_t block_isum_q8_0_vnni(const int8_t* w32, const int8_t* xq, int32_t
     int32_t uncentered = _mm_cvtsi128_si32(sh2);
     return uncentered - 128 * sum_x;
 }
-#endif // __AVX512VNNI__ && __AVX512VL__
 
 } // namespace avx512
 } // namespace simd
-
-#endif // RAWLLM_AVX512
