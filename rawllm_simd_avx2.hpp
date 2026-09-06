@@ -2,14 +2,34 @@
 // =============================================================================
 // rawllm_simd_avx2.hpp — AVX2(+FMA) SIMD kernels.
 //
-// Only compiled in when RAWLLM_AVX2 is defined (rawllm_common.hpp sets this
-// from __AVX2__). FMA is checked independently via __FMA__ since -mavx2
-// alone doesn't guarantee -mfma was also passed by the build.
+// PREVIOUSLY: this whole file was gated behind `#if defined(RAWLLM_AVX2)`,
+// which rawllm_common.hpp only defined when the compiler was invoked with
+// -mavx2 for the ENTIRE translation unit — meaning the codebase had to be
+// built per-target (a "-DUSE_AVX512 build" and a separate "-DUSE_AVX2 build"
+// were genuinely different binaries), and running the wrong binary on the
+// wrong CPU meant SIGILL, not a graceful fallback.
+//
+// NOW: every function here carries its own `__attribute__((target(...)))`
+// instead of relying on whole-TU compile flags. This is GCC/Clang function
+// multiversioning: the compiler emits one code-genned copy of the function
+// per target attribute it sees attached to that name, plus a resolver
+// (backed by an ifunc, checked once via cpuid the first time the symbol is
+// actually referenced) that picks the right copy at runtime — regardless of
+// what -m flags the rest of the translation unit was built with. rawllm_simd_
+// dispatch.hpp's dot_f32/axpy_f32/dot_q4_0_q8_0/dot_q8_0_q8_0 are the actual
+// multiversioned entry points (multiple target-attributed definitions of the
+// same name); the functions in this file are the AVX2-specific bodies they
+// delegate to and are always compiled in now, tagged individually, so they
+// exist in the binary regardless of the TU's baseline -march.
+//
+// Verified empirically (not just assumed) that this pattern works correctly
+// for inline header-only functions included from multiple translation units
+// with no ODR/linker issues, and that the ifunc resolver picks the most
+// specific match a CPU supports (e.g. prefers an avx512vnni-tagged sibling
+// over this file's avx2 one when both are present and the CPU has VNNI).
 // =============================================================================
 
 #include "rawllm_common.hpp"
-
-#if defined(RAWLLM_AVX2)
 #include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
@@ -22,6 +42,16 @@ namespace avx2 {
 // single accumulator chain leaves the FMA port stalling on its own output;
 // two independent accumulation chains give the scheduler two in-flight FMAs
 // to interleave, closing most of that latency gap. Combined at the end.
+//
+// Always uses FMA (no runtime/compile-time FMA check): every AVX2 CPU that
+// exists in practice also has FMA3 (Haswell+ on Intel, Excavator+ on AMD —
+// there was never a mainstream AVX2-without-FMA3 part), and the target
+// attribute below guarantees the compiler can use it regardless of the
+// TU's own -m flags, so there's no need for the old `#if defined(__FMA__)`
+// TU-level check (which, per-function multiversioning, wasn't even asking
+// the right question — that macro reflects the whole TU's flags, not this
+// specific function's target attribute).
+__attribute__((target("avx2,fma")))
 inline float dot_f32(const float* a, const float* b, size_t n) {
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -29,21 +59,12 @@ inline float dot_f32(const float* a, const float* b, size_t n) {
     for (; i + 16 <= n; i += 16) {
         __m256 a0 = _mm256_loadu_ps(a + i),     b0 = _mm256_loadu_ps(b + i);
         __m256 a1 = _mm256_loadu_ps(a + i + 8), b1 = _mm256_loadu_ps(b + i + 8);
-#if defined(__FMA__)
         acc0 = _mm256_fmadd_ps(a0, b0, acc0);
         acc1 = _mm256_fmadd_ps(a1, b1, acc1);
-#else
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(a0, b0));
-        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(a1, b1));
-#endif
     }
     for (; i + 8 <= n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i), vb = _mm256_loadu_ps(b + i);
-#if defined(__FMA__)
         acc0 = _mm256_fmadd_ps(va, vb, acc0);
-#else
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(va, vb));
-#endif
     }
     __m256 acc = _mm256_add_ps(acc0, acc1);
     __m128 lo = _mm256_castps256_ps128(acc);
@@ -56,17 +77,14 @@ inline float dot_f32(const float* a, const float* b, size_t n) {
     return sum;
 }
 
+__attribute__((target("avx2,fma")))
 inline void axpy_f32(float* out, float w, const float* v, size_t n) {
     __m256 vw = _mm256_set1_ps(w);
     size_t i = 0;
     for (; i + 8 <= n; i += 8) {
         __m256 vo = _mm256_loadu_ps(out + i);
         __m256 vv = _mm256_loadu_ps(v + i);
-#if defined(__FMA__)
         vo = _mm256_fmadd_ps(vw, vv, vo);
-#else
-        vo = _mm256_add_ps(vo, _mm256_mul_ps(vw, vv));
-#endif
         _mm256_storeu_ps(out + i, vo);
     }
     for (; i < n; ++i) out[i] += w * v[i];
@@ -79,6 +97,7 @@ inline void axpy_f32(float* out, float w, const float* v, size_t n) {
 // the way full-range i8xi8 would), then horizontally reduces to a scalar
 // int32 uncentered sum; the caller applies the -8-per-nibble bias via the
 // closed-form sum_x correction (same trick every backend uses).
+__attribute__((target("avx2,fma")))
 inline int32_t block_isum_q4_0(const uint8_t* qs, const int8_t* xq) {
     __m128i raw  = _mm_loadu_si128((const __m128i*)qs);
     __m128i mask = _mm_set1_epi8(0x0F);
@@ -110,6 +129,7 @@ inline int32_t block_isum_q4_0(const uint8_t* qs, const int8_t* xq) {
 // saturation possible) and multiply-accumulate in the 16-bit domain,
 // horizontally reducing to int32 only at the end via _mm256_madd_epi16.
 // Bit-exact-validated against the scalar int32 accumulator.
+__attribute__((target("avx2,fma")))
 inline int32_t block_isum_q8_0(const int8_t* w, const int8_t* xq) {
     // 32 lanes don't fit one 128-bit widen (cvtepi8_epi16 takes 16 bytes ->
     // 16 int16 in a 256-bit reg), so widen the low and high halves of the
@@ -135,5 +155,3 @@ inline int32_t block_isum_q8_0(const int8_t* w, const int8_t* xq) {
 
 } // namespace avx2
 } // namespace simd
-
-#endif // RAWLLM_AVX2
