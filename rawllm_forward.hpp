@@ -550,8 +550,11 @@ inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
 // dot_f32 / axpy_f32 / dot_q4_0_q8_0 / dot_q8_0_q8_0 all live in
 // rawllm_simd_dispatch.hpp now (split into rawllm_simd_scalar.hpp /
 // rawllm_simd_avx2.hpp / rawllm_simd_avx512.hpp underneath), which picks
-// AVX-512 > AVX2 > scalar at compile time from the same RAWLLM_AVX2 /
-// RAWLLM_AVX512 macros rawllm_common.hpp already defines. Pulled in here as
+// AVX-512-VNNI > AVX-512F > AVX2 > scalar AT RUNTIME via GCC/Clang function
+// multiversioning (ifunc, resolved via cpuid on first call) rather than the
+// old compile-time RAWLLM_AVX2/RAWLLM_AVX512 macros — one binary now runs
+// correctly (and fast) across whatever CPU it's actually deployed on,
+// instead of needing a separate build per target ISA. Pulled in here as
 // thin `using` aliases so every call site below (proj_all_positions,
 // proj_all_positions_multi, the attention QK^T/weighted-V loop) keeps
 // calling dot_f32()/axpy_f32()/dot_q4_0_q8_0()/dot_q8_0_q8_0() unqualified,
@@ -560,6 +563,8 @@ using simd::dot_f32;
 using simd::axpy_f32;
 using simd::dot_q4_0_q8_0;
 using simd::dot_q8_0_q8_0;
+using simd::dot4_q4_0_q8_0;
+using simd::dot4_q8_0_q8_0;
 
 // ───────────────────────── matvec / projections ─────────────────────────────
 // GGUF/GGML store a 2-D weight tensor with shape = [cols, rows] where
@@ -581,8 +586,7 @@ using simd::dot_q8_0_q8_0;
 inline void proj_all_positions(const loader::TensorInfo& W,
                                 const float* X, size_t x_stride,
                                 float* Y, size_t y_stride,
-                                size_t seq, util::ThreadPool& pool,
-                                const float* bias = nullptr)
+                                size_t seq, util::ThreadPool& pool)
 {
     if (W.shape.size() < 2)
         throw std::runtime_error("forward(): expected a 2D weight tensor: " + W.name);
@@ -604,22 +608,6 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         gpu::gpu_dequant_supported(W.type) &&
         rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
         gpu::proj_gpu(W, X, x_stride, Y, y_stride, seq, cols, rows, row_bytes, pool);
-        // FIX: the GPU path computes the raw matmul only -- proj_gpu()
-        // itself has no notion of bias, so it has to be added here on the
-        // CPU afterward, same as the CPU paths below. Bias is O(rows) work
-        // (one add per output element, not per weight element), so doing
-        // this on the host after the GEMM result is already downloaded
-        // costs nothing worth optimizing next to the GEMM itself, and it
-        // means proj_gpu()'s untested-on-real-hardware rocBLAS call
-        // sequence doesn't need to grow another responsibility to get
-        // bias support -- it stays exactly what it was benchmarked/reasoned
-        // about above, and bias is bolted on as a separate, trivially
-        // correct pass.
-        if (bias) {
-            for (size_t t = 0; t < seq; ++t)
-                for (size_t r = 0; r < rows; ++r)
-                    Y[t * y_stride + r] += bias[r];
-        }
         return;
     }
 #endif
@@ -674,27 +662,60 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (r0 >= r1) continue;
         any = true;
         pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
-                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr, bias] {
+                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr] {
             size_t nb = cols / 32;
             if (use_q4_0_fast) {
-                for (size_t r = r0; r < r1; ++r) {
-                    const uint8_t* row = W.data_ptr + r * row_bytes;
-                    float b = bias ? bias[r] : 0.f;
-                    for (size_t t = 0; t < seq; ++t)
-                        Y[t * y_stride + r] = dot_q4_0_q8_0(row, q8_d_ptr + t * nb,
-                                                             q8_sum_ptr + t * nb,
-                                                             q8_q_ptr + t * cols, cols) + b;
+                for (size_t t = 0; t < seq; ++t) {
+                    const float*   xd = q8_d_ptr + t * nb;
+                    const int32_t* xs = q8_sum_ptr + t * nb;
+                    const int8_t*  xq = q8_q_ptr + t * cols;
+                    size_t r = r0;
+                    // Batch 4 output rows per call — see the dot4_*
+                    // functions' comment in rawllm_simd_dispatch.hpp for
+                    // why (shares the activation-block load across 4
+                    // independent accumulator chains instead of 4 separate
+                    // single-row calls each reloading it).
+                    for (; r + 4 <= r1; r += 4) {
+                        float out4[4];
+                        dot4_q4_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
+                                       W.data_ptr + (r + 1) * row_bytes,
+                                       W.data_ptr + (r + 2) * row_bytes,
+                                       W.data_ptr + (r + 3) * row_bytes,
+                                       xd, xs, xq, cols, out4);
+                        Y[t * y_stride + r + 0] = out4[0];
+                        Y[t * y_stride + r + 1] = out4[1];
+                        Y[t * y_stride + r + 2] = out4[2];
+                        Y[t * y_stride + r + 3] = out4[3];
+                    }
+                    for (; r < r1; ++r) {
+                        const uint8_t* row = W.data_ptr + r * row_bytes;
+                        Y[t * y_stride + r] = dot_q4_0_q8_0(row, xd, xs, xq, cols);
+                    }
                 }
                 return;
             }
             if (use_q8_0_fast) {
-                for (size_t r = r0; r < r1; ++r) {
-                    const uint8_t* row = W.data_ptr + r * row_bytes;
-                    float b = bias ? bias[r] : 0.f;
-                    for (size_t t = 0; t < seq; ++t)
-                        Y[t * y_stride + r] = dot_q8_0_q8_0(row, q8_d_ptr + t * nb,
-                                                             q8_sum_ptr + t * nb,
-                                                             q8_q_ptr + t * cols, cols) + b;
+                for (size_t t = 0; t < seq; ++t) {
+                    const float*   xd = q8_d_ptr + t * nb;
+                    const int32_t* xs = q8_sum_ptr + t * nb;
+                    const int8_t*  xq = q8_q_ptr + t * cols;
+                    size_t r = r0;
+                    for (; r + 4 <= r1; r += 4) {
+                        float out4[4];
+                        dot4_q8_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
+                                       W.data_ptr + (r + 1) * row_bytes,
+                                       W.data_ptr + (r + 2) * row_bytes,
+                                       W.data_ptr + (r + 3) * row_bytes,
+                                       xd, xs, xq, cols, out4);
+                        Y[t * y_stride + r + 0] = out4[0];
+                        Y[t * y_stride + r + 1] = out4[1];
+                        Y[t * y_stride + r + 2] = out4[2];
+                        Y[t * y_stride + r + 3] = out4[3];
+                    }
+                    for (; r < r1; ++r) {
+                        const uint8_t* row = W.data_ptr + r * row_bytes;
+                        Y[t * y_stride + r] = dot_q8_0_q8_0(row, xd, xs, xq, cols);
+                    }
                 }
                 return;
             }
@@ -709,10 +730,9 @@ inline void proj_all_positions(const loader::TensorInfo& W,
             if (rowbuf.size() < cols) rowbuf.resize(cols);
             for (size_t r = r0; r < r1; ++r) {
                 dequantize_row(W.type, W.data_ptr + r * row_bytes, cols, rowbuf.data());
-                float b = bias ? bias[r] : 0.f;
                 for (size_t t = 0; t < seq; ++t) {
                     const float* x = X + t * x_stride;
-                    Y[t * y_stride + r] = dot_f32(rowbuf.data(), x, cols) + b;
+                    Y[t * y_stride + r] = dot_f32(rowbuf.data(), x, cols);
                 }
             }
         });
@@ -739,7 +759,6 @@ struct ProjTarget {
     const loader::TensorInfo* W;
     float*                    Y;
     size_t                    y_stride;
-    const float*              bias = nullptr; // nullptr => no bias (spec-v1 behavior)
 };
 
 inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
@@ -767,7 +786,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         if (gpu_available && cols && rows &&
             gpu::gpu_dequant_supported(tg.W->type) &&
             rows * cols >= gpu::GPU_DISPATCH_MIN_ELEMS) {
-            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool, tg.bias);
+            proj_all_positions(*tg.W, X, x_stride, tg.Y, tg.y_stride, seq, pool);
         } else {
             cpu_targets.push_back(tg);
         }
@@ -784,7 +803,6 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         size_t row_bytes, cols, y_stride, r0_global, r1_global;
         float* Y;
         FastKind fast;
-        const float* bias;
     };
     std::vector<Span> spans;
     spans.reserve(targets_ref.size());
@@ -823,7 +841,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                     "but not safe to assume in general.");
             any_fast_cols = cols;
         }
-        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast, tg.bias});
+        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast});
         total += rows;
     }
 
@@ -859,13 +877,12 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                     for (size_t g = lo; g < hi; ++g) {
                         size_t r = g - sp.r0_global;
                         const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
-                        float b = sp.bias ? sp.bias[r] : 0.f;
                         for (size_t t = 0; t < seq; ++t)
-                            sp.Y[t * sp.y_stride + r] = ((sp.fast == FastKind::Q4_0)
+                            sp.Y[t * sp.y_stride + r] = (sp.fast == FastKind::Q4_0)
                                 ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
                                                 q8_q_ptr + t * sp.cols, sp.cols)
                                 : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols)) + b;
+                                                q8_q_ptr + t * sp.cols, sp.cols);
                     }
                     continue;
                 }
@@ -873,10 +890,9 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                 for (size_t g = lo; g < hi; ++g) {
                     size_t r = g - sp.r0_global;
                     dequantize_row(sp.W->type, sp.W->data_ptr + r * sp.row_bytes, sp.cols, rowbuf.data());
-                    float b = sp.bias ? sp.bias[r] : 0.f;
                     for (size_t t = 0; t < seq; ++t) {
                         const float* x = X + t * x_stride;
-                        sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), x, sp.cols) + b;
+                        sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), x, sp.cols);
                     }
                 }
             }
@@ -985,29 +1001,12 @@ struct LayerWeights {
     const loader::TensorInfo* ffn_gate  = nullptr;
     const loader::TensorInfo* ffn_up    = nullptr;
     const loader::TensorInfo* ffn_down  = nullptr;
-
-    // Bias vectors (nullptr when cfg.use_bias is false, which
-    // validate_config() already guarantees means these tensors don't exist
-    // in the file at all -- see engine::Config::use_bias). Stored as raw
-    // `const float*` rather than `const TensorInfo*` because F32 GGUF
-    // tensor data IS just a contiguous IEEE754 float array in the mmap'd
-    // file already -- there's no dequant step to defer, so resolving
-    // straight to the pointer once at load time keeps every call site
-    // below a plain nullable pointer instead of a second indirection.
-    const float* attn_q_bias      = nullptr;
-    const float* attn_k_bias      = nullptr;
-    const float* attn_v_bias      = nullptr;
-    const float* attn_out_bias    = nullptr;
-    const float* ffn_gate_bias    = nullptr;
-    const float* ffn_up_bias      = nullptr;
-    const float* ffn_down_bias    = nullptr;
 };
 
 struct ModelWeights {
     const loader::TensorInfo* token_embd  = nullptr;
     const loader::TensorInfo* output_norm = nullptr;
     const loader::TensorInfo* output      = nullptr; // null => tied to token_embd
-    const float*              output_bias = nullptr; // null when untied or use_bias=false
     std::vector<LayerWeights> layers;
 
     // Templated on Loader (GGUFLoader or NCTRLoader) rather than hardcoded —
@@ -1020,23 +1019,12 @@ struct ModelWeights {
         return nullptr;
     }
 
-    // Resolves an optional bias tensor straight to its float data, or
-    // nullptr if absent. validate_config() has already enforced that
-    // presence/type/shape agree with cfg.use_bias before this ever runs,
-    // so this is a lookup, not a second validation pass.
-    template <typename Loader>
-    static const float* find_bias(const Loader& g, const std::string& name) {
-        const loader::TensorInfo* t = find_exact(g, name);
-        return t ? reinterpret_cast<const float*>(t->data_ptr) : nullptr;
-    }
-
     template <typename Loader>
     static ModelWeights build(const Loader& g, const engine::Config& cfg) {
         ModelWeights mw;
         mw.token_embd  = find_exact(g, "token_embd.weight");
         mw.output_norm = find_exact(g, "output_norm.weight");
         mw.output      = find_exact(g, "output.weight"); // optional: tied embeddings if absent
-        if (mw.output) mw.output_bias = find_bias(g, "output.bias");
 
         if (!mw.token_embd)  throw std::runtime_error("forward(): token_embd.weight not found");
         if (!mw.output_norm) throw std::runtime_error("forward(): output_norm.weight not found");
@@ -1054,16 +1042,6 @@ struct ModelWeights {
             L.ffn_gate  = find_exact(g, p + "ffn_gate.weight");
             L.ffn_up    = find_exact(g, p + "ffn_up.weight");
             L.ffn_down  = find_exact(g, p + "ffn_down.weight");
-
-            if (cfg.use_bias) {
-                L.attn_q_bias   = find_bias(g, p + "attn_q.bias");
-                L.attn_k_bias   = find_bias(g, p + "attn_k.bias");
-                L.attn_v_bias   = find_bias(g, p + "attn_v.bias");
-                L.attn_out_bias = find_bias(g, p + "attn_output.bias");
-                L.ffn_gate_bias = find_bias(g, p + "ffn_gate.bias");
-                L.ffn_up_bias   = find_bias(g, p + "ffn_up.bias");
-                L.ffn_down_bias = find_bias(g, p + "ffn_down.bias");
-            }
 
             if (!L.attn_norm || !L.attn_q || !L.attn_k || !L.attn_v || !L.attn_out ||
                 !L.ffn_norm  || (cfg.use_swiglu && !L.ffn_gate) || !L.ffn_up || !L.ffn_down) {
@@ -1100,29 +1078,114 @@ struct ModelWeights {
 // not per call) — for a 32-layer model with kv_dim≈1024 and ctx_len=4096,
 // that's roughly 1GB resident for the lifetime of the process. Allocate-once
 // means you pay that cost a single time at the first chat turn, not per turn.
+// ─────────────────────────── KV cache (V quantized) ──────────────────────────
+// V is stored as int8 with one float scale per (layer, position, kv_head) —
+// Q8_0-style, block size = head_dim. K stays float32.
+//
+// SCOPED, NOT SYMMETRIC, ON PURPOSE: K is left unquantized because
+// kv_cache_shift() (below) rotates K IN PLACE via rope_rotate_by_delta() —
+// exact RoPE rotation needs continuous float precision, and correctly
+// requantizing after every rotation (recomputing per-position scales,
+// re-deriving int8 values, all before the NEXT layer's attention reads them)
+// is real additional complexity this pass doesn't take on. V never gets
+// rotated (RoPE is never applied to V — see kv_cache_shift's own comment),
+// so quantizing it doesn't interact with the shift logic at all: shifting
+// quantized V is a plain memmove of int8 bytes plus their scales, same
+// shape as the float memmove it replaces.
+//
+// This is a real, if partial, memory/bandwidth win: V's contribution to the
+// cache shrinks 4x (f32 -> int8 + a per-head-block float scale, so
+// effectively ~4x on the raw values with a small per-block overhead), cutting
+// total KV cache footprint by roughly 3/8 for a typical config where K and V
+// are the same size (K unchanged + V down ~4x = (1 + 0.25)/2 of original).
+// Getting K down too would need the requantize-after-rotate work above —
+// left as a clearly separate follow-up, not attempted here.
 struct KVCache {
-    size_t n_layer  = 0;
-    size_t kv_dim   = 0;
-    size_t capacity = 0;
-    size_t length   = 0;   // number of valid cached positions, same for every layer
-    std::vector<std::vector<float>> K, V;  // [layer][capacity * kv_dim]
+    size_t n_layer   = 0;
+    size_t n_kv_head = 0;
+    size_t head_dim  = 0;
+    size_t kv_dim    = 0;   // = n_kv_head * head_dim, kept for K's existing shape
+    size_t capacity  = 0;
+    size_t length    = 0;   // number of valid cached positions, same for every layer
+    std::vector<std::vector<float>>   K;      // [layer][capacity * kv_dim], unchanged
+    std::vector<std::vector<int8_t>>  Vq;     // [layer][capacity * kv_dim], int8
+    std::vector<std::vector<float>>   Vscale; // [layer][capacity * n_kv_head]
 
     KVCache() = default;
-    KVCache(size_t n_layer_, size_t kv_dim_, size_t capacity_)
-        : n_layer(n_layer_), kv_dim(kv_dim_), capacity(capacity_),
-          K(n_layer_), V(n_layer_)
+    KVCache(size_t n_layer_, size_t n_kv_head_, size_t head_dim_, size_t capacity_)
+        : n_layer(n_layer_), n_kv_head(n_kv_head_), head_dim(head_dim_),
+          kv_dim(n_kv_head_ * head_dim_), capacity(capacity_),
+          K(n_layer_), Vq(n_layer_), Vscale(n_layer_)
     {
         for (size_t i = 0; i < n_layer_; ++i) {
-            K[i].assign(capacity_ * kv_dim_, 0.f);
-            V[i].assign(capacity_ * kv_dim_, 0.f);
+            K[i].assign(capacity_ * kv_dim, 0.f);
+            Vq[i].assign(capacity_ * kv_dim, 0);
+            Vscale[i].assign(capacity_ * n_kv_head_, 1.0f);
         }
     }
 
     float*       k_row(size_t layer, size_t pos)       { return K[layer].data() + pos * kv_dim; }
-    float*       v_row(size_t layer, size_t pos)       { return V[layer].data() + pos * kv_dim; }
     const float* k_row(size_t layer, size_t pos) const { return K[layer].data() + pos * kv_dim; }
-    const float* v_row(size_t layer, size_t pos) const { return V[layer].data() + pos * kv_dim; }
+
+    // Quantizes one position's full V row (all kv_heads) into the cache in
+    // one call — this is the ONLY place V quantization happens, so every
+    // reader downstream (the attention weighted-sum loop) just consumes
+    // already-quantized int8 + scale, never re-derives it.
+    void write_v_row(size_t layer, size_t pos, const float* v_f32) {
+        int8_t* vq = Vq[layer].data() + pos * kv_dim;
+        float*  sc = Vscale[layer].data() + pos * n_kv_head;
+        for (size_t h = 0; h < n_kv_head; ++h) {
+            const float* src = v_f32 + h * head_dim;
+            float amax = 0.f;
+            for (size_t d = 0; d < head_dim; ++d) amax = std::max(amax, std::fabs(src[d]));
+            float scale = amax / 127.0f;
+            float inv = scale > 0.f ? 1.0f / scale : 0.f;
+            sc[h] = scale;
+            int8_t* dst = vq + h * head_dim;
+            for (size_t d = 0; d < head_dim; ++d)
+                dst[d] = (int8_t)std::clamp((int)std::lround(src[d] * inv), -127, 127);
+        }
+    }
+
+    const int8_t* v_row_q(size_t layer, size_t pos) const { return Vq[layer].data() + pos * kv_dim; }
+    float v_scale(size_t layer, size_t pos, size_t kv_head) const {
+        return Vscale[layer][pos * n_kv_head + kv_head];
+    }
 };
+
+// Accumulates out[d] += coeff * (float)vq[d] for d in [0, n) — the
+// quantized-V equivalent of axpy_f32, used by the attention weighted-sum
+// loop now that V lives in the cache as int8. `coeff` already has both the
+// softmax weight AND this position's v_scale folded in by the caller, so
+// this is a plain int8-weighted accumulate, no additional scale lookup
+// needed here.
+//
+// TRIED AND REVERTED: online (single-pass, FlashAttention-style) softmax
+// was implemented here — keep a running max/sum and rescale the
+// accumulator by exp(old_max - new_max) whenever a new max is seen, which
+// removes the separate scores[klen] array and its two extra passes over
+// it entirely. It was verified numerically correct (max error ~5e-7
+// against this three-pass version across context lengths 1-100) but
+// measured SLOWER in practice: roughly parity at klen=4096, and ~1.7-1.9x
+// SLOWER at klen=65536-131072 — i.e. it regressed at exactly the long-
+// context workload it was meant to help. Diagnosed why with an isolated
+// microbenchmark: the memory-access-pattern/rescale-arithmetic theory was
+// wrong (an isolated plain-axpy vs rescale+axpy comparison showed no
+// difference), the real cost is that the online formulation calls exp()
+// TWICE per position (once for `correction`, once for the numerator `p`)
+// where the three-pass version below calls it ONCE per position (in its
+// own small, already-cache-resident pass) — exp() is a real transcendental
+// cost, not free arithmetic, and doubling its call rate outweighed
+// whatever the scores[] buffer was costing, since that buffer was already
+// small enough to be cache-resident at realistic sizes. A real win would
+// need BLOCK-wise online softmax (amortize the rescale/exp cost over a
+// chunk of positions, combine chunks with the online formula only at
+// chunk boundaries — this is what production FlashAttention kernels
+// actually do) rather than the position-wise version tried here; that's
+// materially more implementation complexity and wasn't attempted.
+inline void axpy_i8(float* out, float coeff, const int8_t* vq, size_t n) {
+    for (size_t d = 0; d < n; ++d) out[d] += coeff * (float)vq[d];
+}
 
 // ───────────────────────── context-window shift ──────────────────────────────
 // Called (from NEON.cpp's ensure_cache_room(), not automatically — the
@@ -1160,8 +1223,16 @@ inline void kv_cache_shift(KVCache& cache, size_t keep, size_t discard,
         }
         std::memmove(cache.k_row(li, keep), cache.k_row(li, keep + discard),
                      tail_len * kv_dim * sizeof(float));
-        std::memmove(cache.v_row(li, keep), cache.v_row(li, keep + discard),
-                     tail_len * kv_dim * sizeof(float));
+        // V never gets rotated (see this function's header comment), so
+        // shifting it is a plain memmove of the quantized bytes plus their
+        // per-position-per-head scales — same shape as the float memmove
+        // it used to be, just two arrays (values, scales) instead of one.
+        std::memmove(cache.Vq[li].data() + keep * kv_dim,
+                     cache.Vq[li].data() + (keep + discard) * kv_dim,
+                     tail_len * kv_dim * sizeof(int8_t));
+        std::memmove(cache.Vscale[li].data() + keep * n_kv_head,
+                     cache.Vscale[li].data() + (keep + discard) * n_kv_head,
+                     tail_len * n_kv_head * sizeof(float));
     }
     cache.length = keep + tail_len;
 }
@@ -1283,9 +1354,9 @@ inline void transformer_forward(const engine::Config& cfg,
         // thread-pool round trip instead of three (see
         // proj_all_positions_multi()'s header comment).
         proj_all_positions_multi({
-            {L.attn_q, q.data(), q_dim,  L.attn_q_bias},
-            {L.attn_k, k.data(), kv_dim, L.attn_k_bias},
-            {L.attn_v, v.data(), kv_dim, L.attn_v_bias},
+            {L.attn_q, q.data(), q_dim},
+            {L.attn_k, k.data(), kv_dim},
+            {L.attn_v, v.data(), kv_dim},
         }, normed.data(), n_embd, seq, pool);
         stage_mark(us_proj);
 
@@ -1298,10 +1369,12 @@ inline void transformer_forward(const engine::Config& cfg,
 
         // ── Write this layer's new K/V into the cache BEFORE attention ───
         // so the attention loop below can read every position — old and
-        // new — uniformly from cache.k_row()/v_row() with no special-casing.
+        // new — uniformly from cache.k_row()/v_row_q() with no special-
+        // casing. V goes through write_v_row(), which quantizes it to int8
+        // (see KVCache's header comment for why V and not K).
         for (size_t t = 0; t < seq; ++t) {
             std::memcpy(cache.k_row(li, base_pos + t), &k[t * kv_dim], kv_dim * sizeof(float));
-            std::memcpy(cache.v_row(li, base_pos + t), &v[t * kv_dim], kv_dim * sizeof(float));
+            cache.write_v_row(li, base_pos + t, &v[t * kv_dim]);
         }
 
         // ── Causal GQA self-attention, reading K/V from the cache ───────
@@ -1340,8 +1413,13 @@ inline void transformer_forward(const engine::Config& cfg,
                         float inv = 1.0f / sum;
                         float* outp = &attn_out[t * q_dim + hh * head_dim];
                         std::fill(outp, outp + head_dim, 0.f);
-                        for (size_t s = 0; s < klen; ++s)
-                            axpy_f32(outp, scores[s] * inv, cache.v_row(li, s) + kvh * head_dim, head_dim);
+                        for (size_t s = 0; s < klen; ++s) {
+                            // v_scale folded into the coefficient here so
+                            // axpy_i8 itself stays a plain int8-weighted
+                            // accumulate with no per-call scale lookup.
+                            float coeff = scores[s] * inv * cache.v_scale(li, s, kvh);
+                            axpy_i8(outp, coeff, cache.v_row_q(li, s) + kvh * head_dim, head_dim);
+                        }
                     }
                 });
             }
@@ -1350,7 +1428,7 @@ inline void transformer_forward(const engine::Config& cfg,
         stage_mark(us_attn);
 
         // ── output projection + residual ───────────────────────────────
-        proj_all_positions(*L.attn_out, attn_out.data(), q_dim, proj_out.data(), n_embd, seq, pool, L.attn_out_bias);
+        proj_all_positions(*L.attn_out, attn_out.data(), q_dim, proj_out.data(), n_embd, seq, pool);
         stage_mark(us_proj);
         for (size_t i = 0; i < seq * n_embd; ++i) h[i] += proj_out[i];
         stage_mark(us_resid);
@@ -1378,18 +1456,18 @@ inline void transformer_forward(const engine::Config& cfg,
             // FIX (perf): same fusion as Q/K/V above — gate and up share
             // the same ff_normed input, one round trip instead of two.
             proj_all_positions_multi({
-                {L.ffn_gate, gate_buf.data(), n_ff, L.ffn_gate_bias},
-                {L.ffn_up,   up_buf.data(),   n_ff, L.ffn_up_bias},
+                {L.ffn_gate, gate_buf.data(), n_ff},
+                {L.ffn_up,   up_buf.data(),   n_ff},
             }, ff_normed.data(), n_embd, seq, pool);
             for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
         } else {
             // Plain SiLU-FFN: no gate projection — silu applied directly to up.
-            proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool, L.ffn_up_bias);
+            proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool);
             for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(up_buf[i]);
         }
         stage_mark(us_proj);
 
-        proj_all_positions(*L.ffn_down, ff_act.data(), n_ff, ff_down.data(), n_embd, seq, pool, L.ffn_down_bias);
+        proj_all_positions(*L.ffn_down, ff_act.data(), n_ff, ff_down.data(), n_embd, seq, pool);
         stage_mark(us_proj);
         for (size_t i = 0; i < seq * n_embd; ++i) h[i] += ff_down[i];
         stage_mark(us_resid);
@@ -1430,7 +1508,7 @@ inline void transformer_forward(const engine::Config& cfg,
     // directly as the output projection with no special-casing.
     // seq=1 here, so proj_all_positions takes the decode/row-parallel path.
     const loader::TensorInfo* out_w = mw.output ? mw.output : mw.token_embd;
-    proj_all_positions(*out_w, final_normed.data(), n_embd, out_logits, cfg.n_vocab, 1, pool, mw.output_bias);
+    proj_all_positions(*out_w, final_normed.data(), n_embd, out_logits, cfg.n_vocab, 1, pool);
 }
 
 } // namespace fwd
