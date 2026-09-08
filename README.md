@@ -54,8 +54,9 @@ full "why" and the exact tensor/metadata contract.
   it, is the next piece of work here, not something this header claims to
   do yet.
 
-**NCTR** Nctr is still not wired in and not tested. NCTRloader currently
-does not replace NEON's GGUFloader.
+**NCTR** Nctr is still not wired in. NCTRloader currently
+does not fully replace NEON's GGUFloader. However, it may be added in v0.3
+or later.
 
 - Single-operator, no independent security audit yet (see `LICENSE`).
 
