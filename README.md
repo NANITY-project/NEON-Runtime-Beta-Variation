@@ -37,31 +37,6 @@ full "why" and the exact tensor/metadata contract.
 
 ## Known limitations
 
-- **Bias support (spec-v1.1, opt-in via `nanity.use_bias`).** A file with
-  `nanity.use_bias=false` (or the key absent — every existing NANITY v1
-  file) is bias-free, byte-identical to before this was added. A file with
-  `nanity.use_bias=true` must carry a matching 1-D F32 `.bias` tensor
-  alongside every attn Q/K/V/O and FFN gate/up/down projection (plus
-  `output.bias` if the output projection is untied) — `validate_config()`
-  checks presence, dtype, and shape, and fails loudly (naming the exact
-  tensor) if the file's declared flag and its actual tensors disagree in
-  either direction.
-  Previously, `validate_config()` implemented this check, but
-  `rawllm_forward.hpp` never actually read or added a single bias tensor —
-  a converted-and-validated bias model would load successfully and then
-  silently run with every bias term dropped, which is why Qwen2 conversion
-  testing wasn't producing usable output. Fixed and verified end-to-end: a
-  synthetic GGUF file with `use_bias=true` and all-zero bias tensors now
-  produces output byte-identical to the same weights with no bias tensors
-  at all (max logit diff 0), and the same file with nonzero bias produces
-  clearly different output (max logit diff ~2, vs a ~1e-4 numerical-noise
-  floor) — confirming bias is actually read from the file and flows
-  through every projection (CPU dequant path, both fused Q4_0/Q8_0 int8
-  paths, and the ROCm GPU dispatch path below), not just validated and
-  discarded. `nanity_convert.py --drop-nonzero-bias-anyway` (lossy) is no
-  longer the only option for bias-having source models; a converter path
-  that preserves bias into `nanity.use_bias=true` output is the natural
-  follow-up, not done here.
 - **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
   gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
   descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
@@ -78,17 +53,65 @@ full "why" and the exact tensor/metadata contract.
   worth it, and actually routing `proj_all_positions()` through the GPU for
   it, is the next piece of work here, not something this header claims to
   do yet.
-- **ROCm GPU dispatch** (`rawllm_forward.hpp`'s `gpu::` namespace, gated
-  behind `-DUSE_ROCBLAS` + `__HIP_PLATFORM_AMD__`/`USE_ROCM`): weight
-  tensors are dequantized and uploaded to the device once (keyed by the
-  tensor's stable mmap pointer) and reused across every subsequent token,
-  with per-projection GEMM dispatch above a size threshold so small
-  tensors stay on the CPU int8 fast path. **Not compiled/tested on real
-  ROCm hardware in the environment this was written in** — needs an
-  on-device run on an actual MI300X-class box (build with `-DUSE_ROCBLAS`
-  and diff a few logits against the CPU path) before trusting it for real
-  inference.
+
+**NCTR** Nctr is still not wired in and not tested. NCTRloader currently
+does not replace NEON's GGUFloader.
+
 - Single-operator, no independent security audit yet (see `LICENSE`).
+
+## Out of scope
+
+Two different kinds of "not here": things this project will never be, and
+things that are just sequenced after other work. Mixing those together is
+how a focused runtime slowly turns into a second llama.cpp — writing the
+line down now is meant to stop that before it starts.
+
+**Permanently out of scope — not planned, not "later":**
+- **Continuous batching / paged attention** (vLLM-style block-table KV
+  cache, prefix sharing across concurrent requests). This isn't a kernel
+  you add, it's request scheduling and memory pooling — architecturally
+  most of what makes a multi-tenant serving engine a multi-tenant serving
+  engine. NEON is a single-user runtime (one companion, one conversation
+  at a time); taking this on would roughly double the codebase's
+  conceptual surface for a capability this project doesn't need.
+- **Serving many models, or many requests, on one GPU.** Same reasoning —
+  NEON is not trying to be an inference server.
+- **Mixture-of-Experts.** NANITY is a fixed, single dense architecture on
+  purpose (see the spec) — no per-architecture branching, and MoE routing
+  is exactly the kind of per-architecture special case this project
+  exists to avoid.
+- **GPU flash-attention** (finishing the composable_kernel `DeviceMHAFwd`
+  stub in `rawllm_rocm.hpp`). Pulling in CK as a real dependency and
+  validating a fused attention kernel against real hardware is its own
+  project, not an incremental addition to this one. An online-softmax
+  CPU-side attempt at part of this was tried and reverted after
+  benchmarking showed it regressed at long context (doubled `exp()` calls
+  per position outweighed the memory-traffic savings it was meant to
+  provide) — see the git history on `rawllm_forward.hpp`'s attention loop
+  if you want the specifics before trying this again.
+- **A Vulkan quantized (Q4_0/Q8_0/K-quant) compute shader.** Vulkan isn't
+  this project's primary GPU target (ROCm is) and int8 shader support
+  isn't universal across Vulkan implementations — adding a kernel that
+  can't be validated on real hardware here is exactly the kind of surface
+  that rots silently.
+
+**Deferred, not ruled out — sequenced behind validating what's already
+here:**
+- **K-quant (Q4_K/Q5_K/Q6_K) fused int8 kernels.** Only Q4_0/Q8_0 get the
+  fast fused path today; K-quants fall through to full dequantize-to-F32.
+  Deliberately not adding this yet: Q4_0 itself hasn't been proven to
+  produce reliably coherent, instruction-following output end-to-end (see
+  Known limitations above — TinyLlama Q4_0 currently produces valid
+  English that doesn't follow the prompt, and it isn't confirmed whether
+  that's a quantization/model accuracy issue or a runtime bug). Adding
+  more quantization formats on top of an unproven one is how you end up
+  debugging two things at once instead of one. Once Q4_0/Q8_0 are
+  confirmed producing coherent, prompt-following output on a real
+  instruct model, K-quants are the natural next step — not before.
+- **ROCm and Vulkan, generally.** Both compile and (for ROCm) have run
+  real inference on an MI300X — see the notes above for exactly what's
+  been verified on real hardware vs. compile-tested only. Neither is
+  "done," but both are active, not abandoned.
 
 ## CPU SIMD backends
 
