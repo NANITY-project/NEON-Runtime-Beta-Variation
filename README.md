@@ -106,12 +106,6 @@ line down now is meant to stop that before it starts.
   per position outweighed the memory-traffic savings it was meant to
   provide) — see the git history on `rawllm_forward.hpp`'s attention loop
   if you want the specifics before trying this again.
-- **A Vulkan quantized (Q4_0/Q8_0/K-quant) compute shader.** Vulkan isn't
-  this project's primary GPU target (ROCm is) and int8 shader support
-  isn't universal across Vulkan implementations — adding a kernel that
-  can't be validated on real hardware here is exactly the kind of surface
-  that rots silently.
-
 **Deferred, not ruled out — sequenced behind validating what's already
 here:**
 - **K-quant (Q4_K/Q5_K/Q6_K) fused int8 kernels.** Only Q4_0/Q8_0 get the
