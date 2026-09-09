@@ -28,6 +28,7 @@
 #include "nectar_diskmem.hpp"
 #include "nectar_vision.hpp"
 #include "nectar_splice.hpp"
+#include "nectar_zram.hpp"
 #endif
 
 // =============================================================================
@@ -1022,7 +1023,68 @@ static void run_interactive(const engine::Config& cfg,
 // end-of-reply. --idle-max-tokens caps a run for benchmarking; 0 runs until
 // killed.
 // =============================================================================
+// Which zRAM compression backend (nectar_zram.hpp) the idle loop uses when
+// a chunk ages out of the live window. Declared unconditionally (not
+// inside the NANITY_ENABLE_IDLE_LOOP guard below) because IdleLoopArgs
+// references it regardless of build config — CLI parsing always needs
+// somewhere to put --idle-compression's value, even in a build that can't
+// act on it. SoftSlots is intentionally not wired into run_idle_loop()
+// yet — see kv_cache_compact()'s doc comment in rawllm_forward.hpp for
+// exactly what it needs (a forward pass over reserved slot tokens BEFORE
+// the discard, and kv_cache_compact() instead of kv_cache_shift() at that
+// eviction) and why it needs a trained compression objective to produce
+// anything but noise. Selecting it is a hard error at run_idle_loop()
+// entry until that wiring exists, rather than silently falling back to
+// None.
+enum class IdleCompressionKind { None, TextSummary, SoftSlots };
+
 #if defined(NANITY_ENABLE_IDLE_LOOP)
+
+// Standalone forward pass used ONLY by the TextSummary zRAM compressor to
+// summarize a chunk of idle-loop text. Deliberately does NOT touch
+// get_engine_state()'s singleton EngineState/KVCache — that singleton IS
+// the idle loop's own live context; running a second generation through
+// it here (even with a save/restore) would mean this function's prompt
+// tokens and the idle loop's real content fighting over the exact same
+// cache.length/cached_tokens bookkeeping the idle loop is mid-decode on.
+// Builds a small throwaway KVCache instead, sized only for this call, so
+// it structurally cannot collide with or be observed by the idle loop's
+// state. Uses its OWN Tokenizer instance (fresh from gguf.tok_meta) for
+// the same reason: decode_one()/flush() carry partial-UTF8 state that the
+// idle loop's own `tok` is mid-way through — sharing it here would
+// corrupt whichever one decodes next.
+template <typename Loader>
+static std::string summarize_chunk_standalone(const engine::Config& cfg,
+                                                const fwd::ModelWeights& mw,
+                                                const Loader& gguf,
+                                                util::ThreadPool& pool,
+                                                const std::string& chunk_text,
+                                                size_t max_summary_tokens,
+                                                std::mt19937& rng)
+{
+    Tokenizer local_tok(gguf.tok_meta);
+    std::string prompt = "Summarize the following in one short sentence:\n" + chunk_text + "\nSummary:";
+    std::vector<int32_t> ctx = local_tok.encode(prompt, /*add_bos=*/true);
+    if (ctx.empty()) return {};
+
+    size_t cap = ctx.size() + max_summary_tokens + 8;   // exactly this call's needs, nothing shared
+    fwd::KVCache local_cache(cfg.n_layer, (size_t)cfg.n_kv_head, (size_t)cfg.head_dim, cap);
+
+    std::vector<float> logits(cfg.n_vocab, 0.f);
+    fwd::transformer_forward(cfg, mw, ctx, local_cache, logits.data(), pool);
+    int32_t next = sample_top_p(logits.data(), (int)cfg.n_vocab, /*temperature=*/0.3f, /*top_p=*/0.9f, rng);
+
+    std::string out;
+    for (size_t i = 0; i < max_summary_tokens && next != local_tok.eos_id; ++i) {
+        out += local_tok.decode_one(next);
+        std::vector<int32_t> one{ next };
+        fwd::transformer_forward(cfg, mw, one, local_cache, logits.data(), pool);
+        next = sample_top_p(logits.data(), (int)cfg.n_vocab, 0.3f, 0.9f, rng);
+    }
+    out += local_tok.flush();
+    return out;
+}
+
 template <typename Loader>
 static void run_idle_loop(const engine::Config& cfg,
                            const Loader& gguf,
@@ -1038,10 +1100,32 @@ static void run_idle_loop(const engine::Config& cfg,
                            size_t disk_flush_every_tokens,
                            long   disk_flush_interval_s,
                            bool   vision_enabled,
-                           long   vision_poll_ms)
+                           long   vision_poll_ms,
+                           // ── zRAM tier (nectar_zram.hpp) ────────────────
+                           IdleCompressionKind compression_kind,
+                           size_t chunk_tokens,           // 0 disables zRAM entirely — behavior identical to pre-zRAM
+                           size_t zram_ring_capacity,
+                           const std::string& zram_index_path,
+                           size_t summary_max_tokens,
+                           double zram_max_keep_fraction) // cap on keep/kv_window before a summary stops being pinned
 {
     auto& st = get_engine_state(cfg, gguf);
     std::mt19937 rng(std::random_device{}());
+
+    if (compression_kind == IdleCompressionKind::SoftSlots) {
+        throw std::runtime_error(
+            "run_idle_loop(): --idle-compression=slots is not wired yet — "
+            "kv_cache_compact() (rawllm_forward.hpp) exists and is ready, but "
+            "this loop still needs the forward-pass-before-discard sequencing "
+            "and a chunk-aligned discard trigger to call it correctly. See "
+            "kv_cache_compact()'s doc comment for exactly what's missing. Use "
+            "--idle-compression=text or omit the flag for now.");
+    }
+
+    zram::ChunkRing zram_ring(zram_ring_capacity, zram_index_path);
+    std::deque<std::string> pending_chunk;
+    size_t chunk_range_start = 0;   // set once pinned region is known, below
+    size_t next_chunk_id     = 0;
 
     // ---- Build the pinned region: implant block (§3/§4 — seed_text is now
     // the actual compressed personality distillation, not a stand-in;
@@ -1064,7 +1148,15 @@ static void run_idle_loop(const engine::Config& cfg,
             pinned.push_back(filler[i % filler.size()]);
     }
 
-    const size_t keep = pinned.size();
+    // Mutable, not const: a TextSummary compression cycle grows this by
+    // permanently pinning newly-produced summary tokens (see the splice
+    // block inside the main loop below), the same way the original
+    // implant+sink region is pinned here at startup. zram_max_keep_fraction
+    // caps how far that growth is allowed to go before a summary stops
+    // being pinned (still recorded in the ring/index either way — only
+    // whether it re-enters the live cache is capped).
+    size_t keep = pinned.size();
+    chunk_range_start = keep;
     if (keep >= cfg.kv_window) {
         throw std::runtime_error(
             "run_idle_loop(): pinned region (" + std::to_string(keep) +
@@ -1130,6 +1222,67 @@ static void run_idle_loop(const engine::Config& cfg,
 
     int32_t next = sample_top_p(logits.data(), (int)cfg.n_vocab, temperature, top_p, rng);
 
+    // Every discarded piece still goes to idle_disk (the "Disk" tier,
+    // unchanged) — this lambda additionally accumulates it toward a zRAM
+    // chunk when chunk_tokens > 0, so enabling zRAM is strictly additive,
+    // never a substitute for the existing raw disk log.
+    auto evict_piece = [&](const std::string& piece) {
+        idle_disk.add(piece);
+        if (chunk_tokens == 0) return;   // zRAM disabled — behavior identical to before this feature existed
+
+        pending_chunk.push_back(piece);
+        if (pending_chunk.size() < chunk_tokens) return;
+
+        std::string chunk_text;
+        for (const auto& s : pending_chunk) chunk_text += s;
+        size_t range_end = chunk_range_start + pending_chunk.size();
+
+        zram::CompressResult result;
+        if (compression_kind == IdleCompressionKind::TextSummary) {
+            result.splice_text = summarize_chunk_standalone(cfg, st.mw, gguf, pool,
+                                                              chunk_text, summary_max_tokens, rng);
+        }
+        // SoftSlots is rejected before this loop ever starts (see the
+        // guard at the top of run_idle_loop), so no branch for it here.
+
+        zram::ChunkPointer ptr;
+        ptr.chunk_id          = next_chunk_id++;
+        ptr.token_range_start = chunk_range_start;
+        ptr.token_range_end   = range_end;
+        ptr.summary           = result.splice_text;
+        ptr.num_soft_slots    = result.num_soft_slots;   // always 0 on the TextSummary path
+        ptr.raw_text          = chunk_text;
+        zram_ring.push(ptr);
+
+        // Fold the summary into the pinned region permanently — same
+        // ensure_cache_room()/forward() primitives the startup implant and
+        // the vision splice below already use, just growing `keep`
+        // afterward so this survives every future shift too, not only the
+        // next one. zram_max_keep_fraction stops that growth from
+        // eventually crowding out the whole rolling window; a summary that
+        // exceeds it is still recorded in the ring/index, just not pinned.
+        if (!result.splice_text.empty()) {
+            std::vector<int32_t> summary_tokens = tok.encode(" " + result.splice_text, /*add_bos=*/false);
+            double prospective_fraction = (double)(keep + summary_tokens.size()) / (double)cfg.kv_window;
+            if (!summary_tokens.empty() && prospective_fraction <= zram_max_keep_fraction) {
+                ensure_cache_room(cfg, st, summary_tokens.size(), keep);
+                fwd::transformer_forward(cfg, st.mw, summary_tokens, st.cache, logits.data(), pool);
+                st.cached_tokens.insert(st.cached_tokens.end(), summary_tokens.begin(), summary_tokens.end());
+                keep += summary_tokens.size();
+                std::cerr << "[Idle][zRAM] chunk " << ptr.chunk_id << " (" << pending_chunk.size()
+                          << " tok) summarized + pinned (" << summary_tokens.size()
+                          << " tok); keep=" << keep << "/" << cfg.kv_window << "\n";
+            } else {
+                std::cerr << "[Idle][zRAM] chunk " << ptr.chunk_id << " summarized but NOT pinned "
+                          << "(would push keep to " << (100.0 * prospective_fraction) << "% of kv_window, "
+                          << "over the " << (100.0 * zram_max_keep_fraction) << "% cap) — still recorded in ring/index.\n";
+            }
+        }
+
+        pending_chunk.clear();
+        chunk_range_start = range_end;
+    };
+
     long produced = 0;
     while (max_tokens == 0 || produced < max_tokens) {
         std::string piece;
@@ -1146,7 +1299,7 @@ static void run_idle_loop(const engine::Config& cfg,
 
         size_t discard = ensure_cache_room(cfg, st, 1, keep);   // may trigger a shift
         for (size_t i = 0; i < discard && !aging.empty(); ++i) {
-            idle_disk.add(aging.front());
+            evict_piece(aging.front());
             aging.pop_front();
         }
 
@@ -1174,7 +1327,7 @@ static void run_idle_loop(const engine::Config& cfg,
                     mstream::push_injected_text(aging, ann_tokens.size(), annotation);
                     size_t ann_discard = ensure_cache_room(cfg, st, ann_tokens.size(), keep);
                     for (size_t i = 0; i < ann_discard && !aging.empty(); ++i) {
-                        idle_disk.add(aging.front());
+                        evict_piece(aging.front());
                         aging.pop_front();
                     }
                     fwd::transformer_forward(cfg, st.mw, ann_tokens, st.cache, logits.data(), pool);
@@ -1248,6 +1401,14 @@ struct IdleLoopArgs {
     long        disk_flush_interval_s   = 30;
     bool        vision_enabled  = false;   // §3/§7 — off by default: needs Hyprland+grim+tesseract
     long        vision_poll_ms  = 2000;
+    // ── zRAM tier (nectar_zram.hpp) — all off by default (chunk_tokens=0
+    //    disables it entirely, identical behavior to before this existed)
+    IdleCompressionKind compression_kind    = IdleCompressionKind::None;
+    size_t               chunk_tokens        = 0;
+    size_t               zram_ring_capacity  = 32;
+    std::string          zram_index_path     = "nectar_zram_index.jsonl";
+    size_t               summary_max_tokens  = 40;
+    double               zram_max_keep_fraction = 0.5;
 };
 
 template <typename Loader>
@@ -1308,7 +1469,9 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
         run_idle_loop(cfg, model, tok, pool, idle.seed_text, idle.sink_tokens,
                       idle.max_tokens, idle.log_every, idle.temperature, idle.top_p,
                       idle.disk_path, idle.disk_flush_every_tokens, idle.disk_flush_interval_s,
-                      idle.vision_enabled, idle.vision_poll_ms);
+                      idle.vision_enabled, idle.vision_poll_ms,
+                      idle.compression_kind, idle.chunk_tokens, idle.zram_ring_capacity,
+                      idle.zram_index_path, idle.summary_max_tokens, idle.zram_max_keep_fraction);
         return 0;
 #else
         std::cerr << "[Mode] Idle loop requested, but this build was compiled without "
@@ -1374,7 +1537,13 @@ int main(int argc, char* argv[]) {
                      "   --idle-disk-flush-tokens <N>   flush to disk after N buffered tokens (default 300)\n"
                      "   --idle-disk-flush-seconds <N>  or after N seconds, whichever comes first (default 30)\n"
                      "   --idle-vision                  enable vision-delta polling+injection (needs Hyprland+grim; OCR needs tesseract)\n"
-                     "   --idle-vision-poll-ms <N>      poll interval for vision deltas (default 2000)\n";
+                     "   --idle-vision-poll-ms <N>      poll interval for vision deltas (default 2000)\n"
+                     "   --idle-compression <none|text|slots>  zRAM tier backend (default none; slots is not wired yet, see nectar_zram.hpp)\n"
+                     "   --idle-chunk-tokens <N>        tokens per zRAM chunk before compression fires (default 0 = zRAM off)\n"
+                     "   --idle-zram-ring <N>           chunk pointers kept resident before indexing to disk (default 32)\n"
+                     "   --idle-zram-index <path>       JSONL index file for chunks that age out of the ring (default nectar_zram_index.jsonl)\n"
+                     "   --idle-summary-tokens <N>      max tokens in a TextSummary compressor's output per chunk (default 40)\n"
+                     "   --idle-zram-max-keep <f>       cap on keep/kv_window before a summary stops being pinned, 0-1 (default 0.5)\n";
         return 1;
     }
 
@@ -1406,6 +1575,24 @@ int main(int argc, char* argv[]) {
         else if (arg == "--idle-disk-flush-seconds"&& i + 1 < argc) idle.disk_flush_interval_s   = std::atol(argv[++i]);
         else if (arg == "--idle-vision")                             idle.vision_enabled = true;
         else if (arg == "--idle-vision-poll-ms"    && i + 1 < argc)  idle.vision_poll_ms = std::atol(argv[++i]);
+        else if (arg == "--idle-compression"       && i + 1 < argc) {
+            std::string v = argv[++i];
+            if      (v == "none")  idle.compression_kind = IdleCompressionKind::None;
+            else if (v == "text")  idle.compression_kind = IdleCompressionKind::TextSummary;
+            else if (v == "slots") idle.compression_kind = IdleCompressionKind::SoftSlots;
+            else { std::cerr << "[Error] --idle-compression: expected none|text|slots, got '" << v << "'\n"; return 1; }
+        }
+        else if (arg == "--idle-chunk-tokens"      && i + 1 < argc) idle.chunk_tokens       = (size_t)std::max(0, std::atoi(argv[++i]));
+        else if (arg == "--idle-zram-ring"         && i + 1 < argc) idle.zram_ring_capacity = (size_t)std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--idle-zram-index"        && i + 1 < argc) idle.zram_index_path    = argv[++i];
+        else if (arg == "--idle-summary-tokens"    && i + 1 < argc) idle.summary_max_tokens  = (size_t)std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--idle-zram-max-keep"     && i + 1 < argc) idle.zram_max_keep_fraction = std::strtod(argv[++i], nullptr);
+    }
+
+    if (idle.enabled && idle.compression_kind != IdleCompressionKind::None && idle.chunk_tokens == 0) {
+        std::cerr << "[Error] --idle-compression=" << (idle.compression_kind == IdleCompressionKind::TextSummary ? "text" : "slots")
+                   << " requires --idle-chunk-tokens > 0 (0 means zRAM stays off regardless of backend selected).\n";
+        return 1;
     }
 
     if (idle.enabled && !idle_seed_file.empty()) {
