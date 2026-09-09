@@ -1299,6 +1299,110 @@ inline void kv_cache_shift(KVCache& cache, size_t keep, size_t discard,
     cache.length = keep + tail_len;
 }
 
+// ───────────────────── zRAM-tier compacting shift ─────────────────────────────
+// Generalizes kv_cache_shift() for the SoftSlots compression backend
+// (nectar_zram.hpp): instead of discarding [keep, keep+discard) outright,
+// preserves `num_slots` representative rows in the freed space. Passing
+// num_slots=0 reduces to exactly kv_cache_shift()'s behavior (verified: the
+// tail_len/delta arithmetic below collapses to the same values) — this is a
+// strict generalization, not a fork, so kv_cache_shift() itself is left
+// untouched and still used by every existing caller.
+//
+// Preconditions this function assumes but does not itself create: the
+// caller has already run a forward() pass over `num_slots` reserved
+// "compression slot" token ids APPENDED to the live cache (i.e. at
+// positions [cache.length-num_slots, cache.length) when this is called),
+// so their K/V already reflects (via ordinary causal attention) everything
+// at and before position cache.length-num_slots-1 — which includes, but is
+// not limited to, the chunk about to be discarded. There is no
+// chunk-local attention mask here: a slot's K/V is a function of the
+// ENTIRE context up to it, not just the chunk being compressed. That's a
+// real semantic gap versus how trained compression schemes (Gist Tokens /
+// AutoCompressors / ICAE) usually work, which typically restrict the
+// slots' attention to the chunk itself via a custom mask so the compressed
+// representation is chunk-local and composable. Closing that gap means
+// adding mask support to transformer_forward() — not attempted here; flag
+// this before training anything against this mechanism.
+//
+// Layout before the call (L = cache.length):
+//   [0, keep)                       pinned, untouched
+//   [keep, keep+discard)            raw chunk being discarded
+//   [keep+discard, L-num_slots)     "true tail" — generated after the
+//                                   chunk, before the slot tokens
+//   [L-num_slots, L)                the slot rows just computed
+// Layout after:
+//   [0, keep)                       unchanged
+//   [keep, keep+num_slots)          slot rows, moved down + RoPE-corrected
+//   [keep+num_slots, keep+num_slots+tail_len)   true tail, moved down + corrected
+// new cache.length = keep + num_slots + tail_len
+inline void kv_cache_compact(KVCache& cache, size_t keep, size_t discard, size_t num_slots,
+                              size_t n_kv_head, size_t head_dim, size_t rope_half,
+                              float rope_scale, const float* freqs)
+{
+    if (discard == 0 && num_slots == 0) return;
+    if (cache.length < num_slots + keep + discard) return;   // malformed call, no-op rather than UB
+
+    const size_t kv_dim   = n_kv_head * head_dim;
+    const size_t L        = cache.length;
+    const size_t tail_len = (L - num_slots) - keep - discard;
+
+    // Constant deltas (independent of row index within each moving block —
+    // every row in a block shifts by the same amount, only the block's
+    // start position differs), same closed form as kv_cache_shift()'s
+    // single delta, just computed for two blocks instead of one.
+    const float delta_slots = -(float)(L - num_slots - keep);              // 0 when num_slots==0 (nothing to move)
+    const float delta_tail  = -(float)(discard - num_slots);               // == -discard when num_slots==0, matching kv_cache_shift()
+
+    for (size_t li = 0; li < cache.n_layer; ++li) {
+        // Rotate both moving blocks IN PLACE at their original positions
+        // first — moving (memmove) happens after, so rotation never reads
+        // already-overwritten data regardless of move order chosen below.
+        if (num_slots > 0) {
+            for (size_t t = 0; t < num_slots; ++t) {
+                float* kp = cache.k_row(li, L - num_slots + t);
+                rope_rotate_by_delta(kp, n_kv_head, head_dim, rope_half,
+                                      delta_slots, rope_scale, freqs);
+            }
+        }
+        for (size_t t = 0; t < tail_len; ++t) {
+            float* kp = cache.k_row(li, keep + discard + t);
+            rope_rotate_by_delta(kp, n_kv_head, head_dim, rope_half,
+                                  delta_tail, rope_scale, freqs);
+        }
+
+        // Move the tail first: its destination range [keep+num_slots,
+        // keep+num_slots+tail_len) == [keep+num_slots, L-discard), which
+        // never overlaps the slots' still-untouched source range
+        // [L-num_slots, L) as long as num_slots <= discard (true by
+        // construction — compression only makes sense when you're keeping
+        // fewer rows than you're discarding) — so it's safe to move the
+        // tail before touching the slots' source data.
+        if (tail_len > 0) {
+            std::memmove(cache.k_row(li, keep + num_slots), cache.k_row(li, keep + discard),
+                         tail_len * kv_dim * sizeof(float));
+            std::memmove(cache.Vq[li].data() + (keep + num_slots) * kv_dim,
+                         cache.Vq[li].data() + (keep + discard) * kv_dim,
+                         tail_len * kv_dim * sizeof(int8_t));
+            std::memmove(cache.Vscale[li].data() + (keep + num_slots) * n_kv_head,
+                         cache.Vscale[li].data() + (keep + discard) * n_kv_head,
+                         tail_len * n_kv_head * sizeof(float));
+        }
+        // Then move the slot rows down into the freed space right after `keep`.
+        if (num_slots > 0) {
+            std::memmove(cache.k_row(li, keep), cache.k_row(li, L - num_slots),
+                         num_slots * kv_dim * sizeof(float));
+            std::memmove(cache.Vq[li].data() + keep * kv_dim,
+                         cache.Vq[li].data() + (L - num_slots) * kv_dim,
+                         num_slots * kv_dim * sizeof(int8_t));
+            std::memmove(cache.Vscale[li].data() + keep * n_kv_head,
+                         cache.Vscale[li].data() + (L - num_slots) * n_kv_head,
+                         num_slots * n_kv_head * sizeof(float));
+        }
+    }
+
+    cache.length = keep + num_slots + tail_len;
+}
+
 // ───────────────────────── the forward pass ─────────────────────────────────
 
 // new_tokens are the tokens to process *this call* — the prompt on the first
