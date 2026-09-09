@@ -34,6 +34,22 @@ full "why" and the exact tensor/metadata contract.
   default, gated behind `-DNANITY_ENABLE_IDLE_LOOP` (needs
   `nectar_diskmem.hpp` / `nectar_vision.hpp` / `nectar_splice.hpp`, all
   present in this repo). The core chat/generation path never needs it.
+  The live KV window (StreamingLLM-style sink+shift, `ensure_cache_room()`
+  in `NEON-3.cpp` / `kv_cache_shift()` in `rawllm_forward.hpp`) is already
+  bounded and runs indefinitely on its own — a fixed `--ctx-len`/`kv_window`
+  never grows unbounded even with `--idle-max-tokens 0`.
+- **zRAM compression tier** (`nectar_zram.hpp`, opt-in via
+  `--idle-compression`/`--idle-chunk-tokens`, needs
+  `-DNANITY_ENABLE_IDLE_LOOP`) — as chunks age out of the live window, a
+  pluggable compressor can fold a summary of them permanently into the
+  pinned implant region instead of letting them vanish outright.
+  `--idle-compression=text` works today (the model summarizes its own
+  outgoing chunk, no training needed). `--idle-compression=slots` (reserved
+  KV-row compression, à la Gist Tokens/AutoCompressors/ICAE) has its core
+  cache primitive (`kv_cache_compact()` in `rawllm_forward.hpp`, unit-tested
+  in `test_kv_cache_compact.cpp`) but is not wired into the idle loop yet —
+  see that function's doc comment for what training/masking work is still
+  needed before it produces anything but noise.
 
 ## Known limitations
 
@@ -181,6 +197,24 @@ glslangValidator -V shaders/matvec_f32.comp -o shaders/matvec_f32.spv
 g++ -std=c++20 -O2 -pthread -DUSE_VULKAN NEON-3.cpp -lvulkan -o neon
 ```
 
+## Testing
+
+`test_kv_cache_compact.cpp` is a standalone unit test for
+`kv_cache_compact()` (the zRAM-tier cache primitive in
+`rawllm_forward.hpp`) — it needs no model weights, since it drives the
+cache directly with synthetic tagged rows and checks the resulting memory
+layout:
+```
+g++ -std=c++20 -O0 -g -pthread test_kv_cache_compact.cpp -o test_kv_cache_compact
+./test_kv_cache_compact
+```
+`test_nctr_loader.cpp` is a standalone smoke test for the `.nctr` loader
+(`rawllm_nctr_loader.hpp`) — it takes a `.nctr` file to load and validate:
+```
+g++ -std=c++20 -O0 -g -pthread test_nctr_loader.cpp -o test_nctr_loader
+./test_nctr_loader path/to/model.nctr
+```
+
 ## Quick start
 
 ```
@@ -226,12 +260,14 @@ in this repo is meant to be worked through hands-on, not studied first.
 | `rawllm_rocm.hpp` | ROCm/HIP backend (optional) |
 | `rawllm_common.hpp`, `rawllm_util.hpp`, `rawllm_json.hpp` | Shared utilities |
 | `nectar_diskmem.hpp`, `nectar_vision.hpp`, `nectar_splice.hpp` | Idle-loop companion-overlay modules (optional feature) |
+| `nectar_zram.hpp` | Idle-loop zRAM tier — chunk-pointer ring buffer + pluggable compression backend (optional feature) |
 | `nanity_convert.py` | Converts third-party GGUF models into NANITY-conformant GGUF |
 | `nanity_data_format.py` | `.nctr` container format definitions |
 | `train_nanity_fixed.py` | Training pipeline + `export_gguf()` / `export_nctr()` |
 | `modeling_nanity.py` | Reference PyTorch implementation of the NANITY architecture |
 | `prepare_data.py` | Training data preparation |
 | `test_nctr_loader.cpp` | Standalone `.nctr` loader smoke test |
+| `test_kv_cache_compact.cpp` | Standalone unit test for `kv_cache_compact()`'s memmove/index bookkeeping (no model weights needed — see "Testing" below) |
 | `NANITY_ARCHITECTURE_SPEC.md` | The spec itself — read this for the full technical contract |
 | `nanity.html` | Project website |
 
