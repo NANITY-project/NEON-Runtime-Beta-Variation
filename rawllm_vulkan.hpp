@@ -147,6 +147,13 @@ public:
 
         download(y_buf, y, y_bytes);
 
+        // Pool was created with maxSets=1 and no vkFreeDescriptorSets call
+        // here meant the SECOND ever call to matvec() on this instance
+        // would fail with VK_ERROR_OUT_OF_POOL_MEMORY -- pool was created
+        // with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT specifically
+        // so this could be freed; it just wasn't being called.
+        vk_check(vkFreeDescriptorSets(device_, desc_pool_, 1, &dset), "vkFreeDescriptorSets");
+
         destroy_buffer(w_buf);
         destroy_buffer(x_buf);
         destroy_buffer(y_buf);
