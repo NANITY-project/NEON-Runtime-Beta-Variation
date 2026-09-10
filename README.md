@@ -119,10 +119,6 @@ here:**
   debugging two things at once instead of one. Once Q4_0/Q8_0 are
   confirmed producing coherent, prompt-following output on a real
   instruct model, K-quants are the natural next step — not before.
-- **ROCm and Vulkan, generally.** Both compile and (for ROCm) have run
-  real inference on an MI300X — see the notes above for exactly what's
-  been verified on real hardware vs. compile-tested only. Neither is
-  "done," but both are active, not abandoned.
 
 ## CPU SIMD backends
 
