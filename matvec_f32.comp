@@ -1,40 +1,54 @@
 #version 450
 // =============================================================================
-// matvec_f32.comp — F32 matvec compute shader for rawllm_vulkan.hpp's
-// experimental VulkanMatvecBackend.
+// matvec_f32.comp v2 — subgroup-per-row F32 matvec (llama.cpp/ggml-vulkan and
+// rocBLAS GEMV kernels use this exact shape: one subgroup/wavefront owns one
+// output row end-to-end, reduces with a subgroup-intrinsic add, and never
+// touches shared memory or a barrier).
 //
-// This was the missing half of the Vulkan backend: rawllm_vulkan.hpp's
-// VulkanMatvecBackend constructor loads "shaders/matvec_f32.spv" and expects
-// the build to have run `glslc`/`glslangValidator -V` on this file first, but
-// this source didn't exist yet — the header could compile, but
-// VulkanMatvecBackend() would throw at construction (read_spirv() failing to
-// open a file that was never produced). This file, plus the build-step note
-// in rawllm_vulkan.hpp's own header comment, closes that gap.
+// v1 (kept as matvec_f32_scalar.comp, still shipped as the fallback pipeline
+// for cols not divisible by 4) put ALL 256 invocations of a workgroup on
+// ONE row and combined them with a shared-memory tree reduction: 8 barrier()
+// round-trips per row, one row finished at a time per workgroup.
 //
-// Contract (must match VulkanMatvecBackend::matvec() / create_descriptor_and_
-// pipeline() exactly):
-//   binding 0: W  — row-major float matrix, rows*cols floats (readonly)
-//   binding 1: x  — shared activation vector, cols floats     (readonly)
-//   binding 2: y  — output vector, rows floats                (writeonly)
+// v2 instead partitions each workgroup into gl_NumSubgroups independent
+// subgroups (256/subgroupSize -- e.g. 8 groups of 32 lanes on most desktop
+// GPUs, 4 groups of 64 on AMD wave64, 32 groups of 8 on lavapipe) and gives
+// EACH subgroup its own row. Every lane's cross-lane reduction happens via
+// subgroupAdd(), which lowers to a handful of hardware shuffle/butterfly
+// instructions with no shared memory and no barrier() at all -- and
+// gl_NumSubgroups rows finish per workgroup dispatch instead of 1. This is
+// the same "N rows per workgroup, wavefront-per-row" trick rocBLAS's GEMV
+// kernels and llama.cpp's mul_mat_vec shaders use for the same reason: a
+// single row's dot product rarely has enough work to keep the reduction
+// tree's later stages (stride 128, 64, 32...) busy, so folding the
+// cross-lane part into subgroup intrinsics and using the freed-up
+// parallelism to cover MORE rows per dispatch is a straight win.
+//
+// Loads are vec4-vectorized (4 floats/lane/iteration instead of 1) to cut
+// the instruction count and better saturate memory bandwidth -- safe here
+// because the host only selects this pipeline when cols % 4 == 0 (see
+// rawllm_vulkan.hpp's pipeline-selection comment); otherwise it dispatches
+// matvec_f32_scalar.comp instead.
+//
+// Contract (must match VulkanMatvecBackend::matvec_f32() / pipeline setup):
+//   binding 0: W  — row-major float matrix reinterpreted as vec4[rows*cols/4]
+//   binding 1: x  — shared activation vector, reinterpreted as vec4[cols/4]
+//   binding 2: y  — output vector, rows floats (writeonly)
 //   push constants: { uint cols; uint rows; }
-//   dispatch: vkCmdDispatch(rows, 1, 1) — one workgroup per output row,
-//             i.e. gl_WorkGroupID.x IS the row index, not just an index hint.
-//
-// Per workgroup: LOCAL_SIZE invocations each stride across that row's `cols`
-// elements accumulating a partial dot product, then a standard shared-memory
-// tree reduction combines the LOCAL_SIZE partials into the row's final
-// scalar, which invocation 0 writes to y[row]. This mirrors the same
-// "quantize once, dot per output row" shape as the CPU path in
-// rawllm_forward.hpp's proj_all_positions() — just parallelized across GPU
-// invocations instead of CPU threads, and over plain F32 (no fused int8
-// path on the GPU side yet — see this shader's header-file counterpart for
-// why that's a documented follow-up, not done here).
+//   dispatch: vkCmdDispatch(ceil(rows / rows_per_workgroup), 1, 1), where
+//             rows_per_workgroup = local_size_x / subgroupSize is computed
+//             host-side from VkPhysicalDeviceSubgroupProperties (queried
+//             once at device pick time) -- gl_NumSubgroups at shader
+//             execution time is the same value, so row indexing agrees.
 // =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer WBuf { float W[]; };
-layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
+layout(std430, binding = 0) readonly buffer WBuf { vec4 Wv[]; };
+layout(std430, binding = 1) readonly buffer XBuf { vec4 Xv[]; };
 layout(std430, binding = 2) writeonly buffer YBuf { float Y[]; };
 
 layout(push_constant) uniform Params {
@@ -42,32 +56,23 @@ layout(push_constant) uniform Params {
     uint rows;
 } params;
 
-shared float partial[256];
-
 void main() {
-    uint row = gl_WorkGroupID.x;
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
     if (row >= params.rows) return;
 
-    uint tid = gl_LocalInvocationID.x;
-    uint row_off = row * params.cols;
+    uint vec_cols = params.cols >> 2u; // cols/4, host guarantees cols % 4 == 0
+    uint row_off = row * vec_cols;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
 
-    float acc = 0.0;
-    for (uint j = tid; j < params.cols; j += gl_WorkGroupSize.x) {
-        acc += W[row_off + j] * X[j];
+    vec4 acc4 = vec4(0.0);
+    for (uint j = lane; j < vec_cols; j += sg_size) {
+        acc4 += Wv[row_off + j] * Xv[j];
     }
-    partial[tid] = acc;
-    barrier();
+    float acc = subgroupAdd(acc4.x + acc4.y + acc4.z + acc4.w);
 
-    // Standard power-of-two tree reduction (workgroup size is fixed at 256
-    // above, so no odd-count tail to handle).
-    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        barrier();
-    }
-
-    if (tid == 0u) {
-        Y[row] = partial[0];
+    if (lane == 0u) {
+        Y[row] = acc;
     }
 }

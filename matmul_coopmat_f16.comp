@@ -1,0 +1,82 @@
+#version 460
+// =============================================================================
+// matmul_coopmat_f16.comp — C[Mp x N] = A[Mp x K] * B[K x N], fp16 x fp16 -> f32,
+// using VK_KHR_cooperative_matrix to run on matrix-core hardware (NVIDIA Tensor
+// Cores, AMD MFMA units, Intel XMX) instead of the manual per-lane dot products
+// every other shader in this backend uses.
+//
+// THIS IS A GEMM SHADER, NOT A GEMV SHADER. One workgroup == one subgroup ==
+// one 16x16 output tile; it needs Mp/16 * N/16 tiles of actual work to be
+// worth dispatching at all. At Mp=16 (the minimum: a single real row, padded)
+// this still launches one workgroup to compute 16 rows' worth of output for
+// 1 row's worth of useful data — a 16x waste. It only pays for itself once
+// there are enough real rows (prefill / multi-token batches) to fill most of
+// that tile. rawllm_vulkan.hpp's queue_matmul_f16() does NOT decide this for
+// you — see that function's header comment.
+//
+// SUBGROUP SIZE: local_size_x is a specialization constant (constant_id=0),
+// set at pipeline-creation time by build_pipeline_specialized() to the
+// device's *default* reported subgroup size (VkPhysicalDeviceSubgroupProperties
+// ::subgroupSize, already queried elsewhere in this backend for the GEMV
+// shaders). This assumes that default is also what the device actually runs
+// this pipeline's subgroups at. That assumption is NOT pinned via
+// VK_EXT_subgroup_size_control's VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+// — see rawllm_vulkan.hpp's query_coop_matrix_shape() comment for why, and
+// what to add if a real device ever needs that pinned explicitly.
+//
+// VALIDATION STATUS: this shader compiles and validates (glslangValidator
+// --target-env vulkan1.3, then spirv-val) to correct SPIR-V — real
+// OpCooperativeMatrixLoadKHR/MulAddKHR/StoreKHR instructions with the
+// CooperativeMatrixKHR capability, Subgroup scope (3), and A/B/Accumulator
+// use operands (0/1/2) all confirmed by disassembly. It has NOT been run on
+// any coop-matrix-capable GPU (no such hardware was available to test
+// against) or checked against a CPU reference for numerical correctness —
+// unlike matvec_f32/matvec_q4_0/matvec_q8_0, which were both. Do that round
+// trip before trusting this for anything real.
+// =============================================================================
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32; // overwritten at pipeline creation; see header comment
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Binding shape (3 storage buffers) matches desc_set_layout3_ in
+// rawllm_vulkan.hpp exactly — this pipeline reuses that descriptor set
+// layout (with its own pipeline layout for the wider push-constant range),
+// so no new descriptor set layout was needed on the host side.
+layout(set = 0, binding = 0) readonly buffer BBuf { float16_t b[]; }; // K x N, row-major — resident weights (upload_weight_f16())
+layout(set = 0, binding = 1) readonly buffer ABuf { float16_t a[]; }; // Mp x K, row-major — per-call activations, host-converted to fp16
+layout(set = 0, binding = 2) writeonly buffer CBuf { float c[]; };    // Mp x N, row-major — f32 accumulator output
+
+layout(push_constant) uniform Push {
+    uint M; // Mp: the PADDED row count (see queue_matmul_f16()'s comment — always a multiple of 16)
+    uint K;
+    uint N;
+} pc;
+
+void main() {
+    // Each workgroup computes exactly one 16x16 output tile.
+    uint row0 = gl_WorkGroupID.x * 16u;
+    uint col0 = gl_WorkGroupID.y * 16u;
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // Accumulate over K in 16-wide steps — the standard tiled-GEMM inner
+    // loop, just with the innermost 16x16x16 multiply-accumulate done by
+    // one coopMatMulAdd() (one matrix-core op) instead of 16*16*16 scalar
+    // FMAs.
+    for (uint k0 = 0u; k0 < pc.K; k0 += 16u) {
+        coopMatLoad(matA, a, row0 * pc.K + k0, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, b, k0 * pc.N + col0, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+    }
+
+    coopMatStore(matC, c, row0 * pc.N + col0, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}

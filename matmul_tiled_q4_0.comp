@@ -1,0 +1,199 @@
+#version 450
+// =============================================================================
+// matmul_tiled_q4_0.comp — batched GEMM for a Q4_0-quantized resident weight
+// tensor against ALREADY-QUANTIZED activation rows. Companion to
+// matmul_tiled_f32.comp: same 16x16 shared-memory-tiled output structure and
+// the same ragged-edge bounds-checking, but the K-reduction loop walks one
+// 32-element Q4_0 block at a time (not one 16-wide tile column at a time)
+// because a block's scale applies to all 32 of its elements — you cannot
+// dequantize half a block. See rawllm_vulkan.hpp's header comment, point 12,
+// for why this shader exists (queue_matmul_q4_0(), the GEMM path that was
+// missing for quantized models before this).
+//
+// BUFFER LAYOUT (bindings match every other shader in this backend's
+// desc_set_layout5_: W, XQ, XD, XSUM, Y):
+//   binding 0 (W):    resident Q4_0 weight tensor, N rows x K cols, laid out
+//                      row-major as N*(K/32) blocks of 18 bytes each — 2-byte
+//                      IEEE-754 half scale, then 16 bytes of packed 4-bit
+//                      nibbles (32 nibbles, low nibble first within each
+//                      byte). A block's 18 bytes are NOT 4-byte aligned
+//                      (18 % 4 != 0), so this buffer is addressed as a flat
+//                      byte stream via get_byte() below, not as uint blocks —
+//                      same reasoning as matvec_q4_0.comp (see
+//                      rawllm_vulkan.hpp's upload_weight_bytes() padding fix
+//                      for the out-of-bounds read this shape can otherwise
+//                      cause on the last row).
+//   binding 1 (XQ):   M rows x K int8 activation values, ALREADY quantized
+//                      by the caller, widened to int32 (one value per 32-bit
+//                      word — see rawllm_vulkan.hpp's queue_matmul_quantized()
+//                      comment on why: no 8-bit storage extension assumed).
+//   binding 2 (XD):   M rows x (K/32) per-block float scales for XQ.
+//   binding 3 (XSUM): M rows x (K/32) per-block int32 sums of XQ's raw
+//                      (pre-dequant) int8 values — needed to correct for
+//                      Q4_0's zero-point: a stored nibble n in [0,15]
+//                      represents the signed weight (n-8), so
+//                        sum_i A_i*(n_i-8) = sum_i A_i*n_i - 8*sum_i A_i
+//                      and XSUM supplies that second term per block, so this
+//                      shader never has to reduce over A's raw values itself.
+//   binding 4 (Y):    M rows x N float outputs (row-major, C = A * B^T in
+//                      the sense that both A and B are stored as row-major
+//                      [rows][K] matrices, output row m / col n is the dot
+//                      of A's row m and B's row n — the same convention
+//                      queue_matvec_q4_0() already uses, just M rows at once).
+//
+// Push constants: uint M, K, N (same struct record_dispatch_matmul() sends
+// for every matmul_* pipeline in this backend).
+//
+// HAS_INT8_DOT: when this backend's build step compiles this source with
+// -DHAS_INT8_DOT=1 (into matmul_tiled_q4_0_dp4a.spv — see rawllm_vulkan.hpp's
+// create_pipelines()), the per-block 32-wide dot product below runs as 8
+// calls to GL_EXT_shader_integer_dot_product's dotPacked4x8EXT() (4 int8 products +
+// accumulate per call) instead of a 32-iteration scalar multiply-add loop.
+// Both paths compute the exact same raw_dot integer; only the instruction
+// count differs. Without the define, this compiles and runs on any device
+// this backend already targets (no extension, no capability check) — the
+// same "portable always-built" shape as matmul_tiled_f32.comp itself.
+//
+// NOT YET VALIDATED: unlike matmul_tiled_f32.comp (which had a standalone
+// lavapipe harness run against a CPU GEMM reference before its wiring was
+// trusted — see rawllm_vulkan.hpp's queue_matmul_f32() comment), this shader
+// has not had the equivalent treatment yet, for either variant. The
+// portable (non-HAS_INT8_DOT) build DOES compile cleanly with glslangValidator
+// and pass spirv-val (checked this pass). The HAS_INT8_DOT build could not
+// even be compiled with the glslang available this pass (glslang-tools
+// 15.1.0-2, Ubuntu 24.04 noble-updates) — its GLSL front end doesn't yet
+// parse `#extension GL_EXT_shader_integer_dot_product` or resolve
+// `dotPacked4x8EXT()`, confirmed with a minimal reproducer, even though it
+// recognizes the SPV_KHR_integer_dot_product string at the SPIR-V level. A
+// newer glslang is needed to even build this variant, separately from
+// needing dot-product-capable hardware to run it.
+// =============================================================================
+
+#ifdef HAS_INT8_DOT
+#extension GL_EXT_shader_integer_dot_product : require
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer WBuf   { uint  w_bytes[]; };  // Q4_0 blocks, flat byte stream (see header)
+layout(std430, binding = 1) readonly buffer XQBuf  { int   xq[]; };       // M*K, widened int8 activations
+layout(std430, binding = 2) readonly buffer XDBuf  { float xd[]; };       // M*(K/32) per-block activation scales
+layout(std430, binding = 3) readonly buffer XSUMBuf{ int   xsum[]; };     // M*(K/32) per-block activation sums
+layout(std430, binding = 4) writeonly buffer YBuf  { float y[]; };        // M*N output
+
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+
+const uint TILE = 16;
+const uint BLOCK = 32;
+const uint Q4_0_BLOCK_BYTES = 18; // 2-byte half scale + 16 packed-nibble bytes
+
+// One row's worth of Q4_0 blocks in bytes: (K/32) * 18.
+uint row_stride_bytes() { return (pc.K / BLOCK) * Q4_0_BLOCK_BYTES; }
+
+// Unaligned byte read from the uint[] buffer (block size 18 isn't a
+// multiple of 4 — see the header comment on why this can't just index
+// w_bytes[] as one uint per 4 elements the way a naturally-aligned format
+// would).
+uint get_byte(uint byte_index) {
+    uint word = w_bytes[byte_index >> 2];
+    uint shift = (byte_index & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float half_to_float(uint lo_byte, uint hi_byte) {
+    uint half_bits = lo_byte | (hi_byte << 8);
+    return unpackHalf2x16(half_bits).x; // low 16 bits carry the half; high 16 (0) -> .y unused
+}
+
+// Reads block `b` of weight row `n` and accumulates this workgroup-tile
+// thread's contribution to the (m, n) output using activation row m's
+// same block b. Shared by both the portable and dp4a code paths below —
+// only the inner 32-wide reduction differs.
+shared int  s_xq[TILE][BLOCK];   // this tile's TILE activation rows' current block, widened int8
+shared float s_xd[TILE];         // this tile's TILE activation rows' current block scale
+shared int  s_xsum[TILE];        // this tile's TILE activation rows' current block sum
+
+void main() {
+    uint tile_m0 = gl_WorkGroupID.x * TILE;
+    uint tile_n0 = gl_WorkGroupID.y * TILE;
+    uint lm = gl_LocalInvocationID.x; // 0..15, row within this tile
+    uint ln = gl_LocalInvocationID.y; // 0..15, col within this tile
+    uint m = tile_m0 + lm;
+    uint n = tile_n0 + ln;
+
+    uint nb = pc.K / BLOCK;
+    uint w_row_stride = row_stride_bytes();
+    float acc = 0.0;
+
+    for (uint b = 0; b < nb; ++b) {
+        // ---- cooperatively stage this block's activation data for the
+        // whole tile's M rows (one thread per (row, lane) pair; ln
+        // indexes the 16-of-32 lanes each thread in this column stages,
+        // so all 256 threads together cover TILE rows x 32 lanes twice
+        // over — harmless duplicate work, avoids a second barrier). ----
+        if (m < pc.M) {
+            uint base = m * pc.K + b * BLOCK;
+            s_xq[lm][ln]      = xq[base + ln];
+            s_xq[lm][ln + 16] = xq[base + ln + 16];
+            if (ln == 0) {
+                s_xd[lm]   = xd[m * nb + b];
+                s_xsum[lm] = xsum[m * nb + b];
+            }
+        }
+        barrier();
+
+        if (m < pc.M && n < pc.N) {
+            uint block_off = n * w_row_stride + b * Q4_0_BLOCK_BYTES;
+            float w_scale = half_to_float(get_byte(block_off), get_byte(block_off + 1u));
+
+            int raw_nibble_dot = 0;
+#ifdef HAS_INT8_DOT
+            // Pack 4 activation ints + 4 unpacked nibbles per call and
+            // let dotPacked4x8EXT() do the 4-wide multiply-accumulate in
+            // one instruction — 8 calls to cover the 32-wide block
+            // instead of 32 scalar multiply-adds. CAVEAT: both operands
+            // here are non-negative byte values (activation bytes are
+            // masked to 0xFF and the driver-visible int8 range this
+            // backend quantizes into is treated as unsigned-packed here;
+            // nibbles are inherently unsigned 0..15) — this call assumes
+            // GL_EXT_shader_integer_dot_product's unsigned-packed
+            // dotPacked4x8EXT(uint,uint) overload. If a real driver's
+            // GLSL headers resolve that name differently (the extension
+            // also defines signed and mixed-sign overloads/suffixes),
+            // this is the first place to check when bringing this shader
+            // up on actual dot-product-capable hardware — untestable
+            // here, no such device (or lavapipe support) was available.
+            for (uint g = 0; g < BLOCK; g += 4u) {
+                uint packed_a = (uint(s_xq[lm][g]) & 0xFFu)
+                              | ((uint(s_xq[lm][g + 1u]) & 0xFFu) << 8)
+                              | ((uint(s_xq[lm][g + 2u]) & 0xFFu) << 16)
+                              | ((uint(s_xq[lm][g + 3u]) & 0xFFu) << 24);
+                // Nibble byte g/2 holds lanes g and g+1 (low/high nibble);
+                // byte (g/2)+1 holds lanes g+2 and g+3.
+                uint nb0 = get_byte(block_off + 2u + (g >> 1));
+                uint nb1 = get_byte(block_off + 2u + (g >> 1) + 1u);
+                uint packed_w = (nb0 & 0x0Fu)
+                              | ((nb0 >> 4) << 8)
+                              | ((nb1 & 0x0Fu) << 16)
+                              | ((nb1 >> 4) << 24);
+                raw_nibble_dot += dotPacked4x8EXT(packed_a, packed_w);
+            }
+#else
+            for (uint i = 0; i < BLOCK; ++i) {
+                uint nibble_byte = get_byte(block_off + 2u + (i >> 1));
+                uint nibble = (i & 1u) == 0u ? (nibble_byte & 0x0Fu) : (nibble_byte >> 4);
+                raw_nibble_dot += s_xq[lm][i] * int(nibble);
+            }
+#endif
+            // Zero-point correction: stored nibble n represents (n-8), so
+            // subtract 8 * (sum of this block's activation values).
+            int raw_dot = raw_nibble_dot - 8 * s_xsum[lm];
+            acc += s_xd[lm] * w_scale * float(raw_dot);
+        }
+        barrier();
+    }
+
+    if (m < pc.M && n < pc.N) {
+        y[m * pc.N + n] = acc;
+    }
+}

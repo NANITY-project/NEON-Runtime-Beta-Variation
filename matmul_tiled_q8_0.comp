@@ -1,0 +1,129 @@
+#version 450
+// =============================================================================
+// matmul_tiled_q8_0.comp — batched GEMM for a Q8_0-quantized resident weight
+// tensor against ALREADY-QUANTIZED activation rows. See matmul_tiled_q4_0.comp
+// for the full design rationale (this file's twin); the only real
+// differences are the block layout (34 bytes: 2-byte half scale + 32 signed
+// int8 values, no packed nibbles) and that Q8_0 has no zero-point to correct
+// for, so XSUM is accepted (for descriptor-layout/API symmetry with the
+// Q4_0 path and queue_matvec_q8_0()) but never read here.
+//
+// BUFFER LAYOUT — see matmul_tiled_q4_0.comp's header for bindings 1-4
+// (identical). Binding 0 (W) here is N*(K/32) blocks of 34 bytes each:
+// 2-byte half scale, then 32 raw signed int8 values (no packing, no
+// zero-point offset — unlike Q4_0's nibbles, these are already the true
+// signed weight values once the scale is applied).
+//
+// HAS_INT8_DOT / validation status: identical situation to
+// matmul_tiled_q4_0.comp — see that file's header comment, including the
+// glslang front-end limitation that blocked even compiling the
+// HAS_INT8_DOT variant this pass (portable variant compiles and
+// spirv-val's cleanly).
+// =============================================================================
+
+#ifdef HAS_INT8_DOT
+#extension GL_EXT_shader_integer_dot_product : require
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer WBuf   { uint  w_bytes[]; };  // Q8_0 blocks, flat byte stream (see header)
+layout(std430, binding = 1) readonly buffer XQBuf  { int   xq[]; };       // M*K, widened int8 activations
+layout(std430, binding = 2) readonly buffer XDBuf  { float xd[]; };       // M*(K/32) per-block activation scales
+layout(std430, binding = 3) readonly buffer XSUMBuf{ int   xsum[]; };     // unused here — see header comment
+layout(std430, binding = 4) writeonly buffer YBuf  { float y[]; };        // M*N output
+
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+
+const uint TILE = 16;
+const uint BLOCK = 32;
+const uint Q8_0_BLOCK_BYTES = 34; // 2-byte half scale + 32 signed int8 values
+
+uint row_stride_bytes() { return (pc.K / BLOCK) * Q8_0_BLOCK_BYTES; }
+
+// Same unaligned-byte-read reasoning as matmul_tiled_q4_0.comp — 34 isn't
+// a multiple of 4 either.
+uint get_byte(uint byte_index) {
+    uint word = w_bytes[byte_index >> 2];
+    uint shift = (byte_index & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float half_to_float(uint lo_byte, uint hi_byte) {
+    uint half_bits = lo_byte | (hi_byte << 8);
+    return unpackHalf2x16(half_bits).x;
+}
+
+// Sign-extends a byte read out of the block (Q8_0 values are stored as
+// raw two's-complement int8, unlike Q4_0's unsigned 4-bit nibbles).
+int get_i8(uint byte_index) {
+    uint b = get_byte(byte_index);
+    return int(b << 24) >> 24;
+}
+
+shared int   s_xq[TILE][BLOCK];
+shared float s_xd[TILE];
+
+void main() {
+    uint tile_m0 = gl_WorkGroupID.x * TILE;
+    uint tile_n0 = gl_WorkGroupID.y * TILE;
+    uint lm = gl_LocalInvocationID.x;
+    uint ln = gl_LocalInvocationID.y;
+    uint m = tile_m0 + lm;
+    uint n = tile_n0 + ln;
+
+    uint nb = pc.K / BLOCK;
+    uint w_row_stride = row_stride_bytes();
+    float acc = 0.0;
+
+    for (uint b = 0; b < nb; ++b) {
+        if (m < pc.M) {
+            uint base = m * pc.K + b * BLOCK;
+            s_xq[lm][ln]      = xq[base + ln];
+            s_xq[lm][ln + 16] = xq[base + ln + 16];
+            if (ln == 0) {
+                s_xd[lm] = xd[m * nb + b];
+            }
+        }
+        barrier();
+
+        if (m < pc.M && n < pc.N) {
+            uint block_off = n * w_row_stride + b * Q8_0_BLOCK_BYTES;
+            float w_scale = half_to_float(get_byte(block_off), get_byte(block_off + 1u));
+
+            int raw_dot = 0;
+#ifdef HAS_INT8_DOT
+            // Same packing approach as matmul_tiled_q4_0.comp's dp4a
+            // path, minus the nibble unpack — Q8_0 bytes are already
+            // individual signed int8 weight values, so 4 of them pack
+            // directly. See that file's header comment for the same
+            // unsigned-vs-signed-overload caveat; this path's weight
+            // bytes ARE genuinely signed (unlike Q4_0's unsigned
+            // nibbles), so this is the more likely candidate to need a
+            // signed dotPacked4x8EXT overload (or manual sign-extension
+            // before packing) once run against real hardware.
+            for (uint g = 0; g < BLOCK; g += 4u) {
+                uint packed_a = (uint(s_xq[lm][g]) & 0xFFu)
+                              | ((uint(s_xq[lm][g + 1u]) & 0xFFu) << 8)
+                              | ((uint(s_xq[lm][g + 2u]) & 0xFFu) << 16)
+                              | ((uint(s_xq[lm][g + 3u]) & 0xFFu) << 24);
+                uint packed_w = (uint(get_byte(block_off + 2u + g)) & 0xFFu)
+                              | ((uint(get_byte(block_off + 2u + g + 1u)) & 0xFFu) << 8)
+                              | ((uint(get_byte(block_off + 2u + g + 2u)) & 0xFFu) << 16)
+                              | ((uint(get_byte(block_off + 2u + g + 3u)) & 0xFFu) << 24);
+                raw_dot += dotPacked4x8EXT(packed_a, packed_w);
+            }
+#else
+            for (uint i = 0; i < BLOCK; ++i) {
+                raw_dot += s_xq[lm][i] * get_i8(block_off + 2u + i);
+            }
+#endif
+            acc += s_xd[lm] * w_scale * float(raw_dot);
+        }
+        barrier();
+    }
+
+    if (m < pc.M && n < pc.N) {
+        y[m * pc.N + n] = acc;
+    }
+}

@@ -1,0 +1,52 @@
+#version 450
+// =============================================================================
+// matvec_f32_scalar.comp — fallback F32 matvec for cols % 4 != 0, where
+// matvec_f32.comp's vec4-reinterpreted buffer bindings would read past the
+// end of X's last partial vec4 (and past W's last partial vec4 per row).
+// Same subgroup-per-row / subgroupAdd shape as matvec_f32.comp, just
+// scalar-element loads instead of vec4 — still no shared memory, no
+// barrier(), still gl_NumSubgroups rows finished per workgroup. This
+// replaces the original v1 shader's 256-wide shared-memory tree reduction
+// (kept in git history), which needed 8 barrier() round-trips to finish
+// ONE row per workgroup dispatch; that approach is no longer used anywhere
+// in this backend now that both the vectorized and fallback paths use
+// subgroup intrinsics.
+//
+// Contract: identical to matvec_f32.comp except W/X are plain float arrays,
+// not vec4-reinterpreted. Selected automatically by
+// VulkanMatvecBackend::matvec_f32() when cols % 4 != 0.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer WBuf { float W[]; };
+layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
+layout(std430, binding = 2) writeonly buffer YBuf { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    if (row >= params.rows) return;
+
+    uint row_off = row * params.cols;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint j = lane; j < params.cols; j += sg_size) {
+        acc += W[row_off + j] * X[j];
+    }
+    acc = subgroupAdd(acc);
+
+    if (lane == 0u) {
+        Y[row] = acc;
+    }
+}

@@ -1,0 +1,89 @@
+#version 450
+// =============================================================================
+// matmul_tiled_f32.comp — C[M x N] = A[M x K] * B[K x N], all F32, using the
+// classic shared-memory tiled-GEMM pattern (cooperative load into `shared`
+// tiles, barrier(), accumulate, repeat over K). No extension, no matrix-core
+// hardware, no minimum-device-capability requirement beyond what
+// matvec_f32.comp already needs — this runs on literally anything this
+// backend's other shaders run on, including lavapipe.
+//
+// WHY THIS EXISTS ALONGSIDE matmul_coopmat_f16.comp: that shader needs
+// VK_KHR_cooperative_matrix + a specific MxNxK/type shape, which most
+// devices (most integrated GPUs, older discrete cards, anything without
+// dedicated matrix-core hardware) simply don't have — on those devices,
+// prefill currently has NO batched-GEMM path at all, only a loop of
+// matvec_f32() calls (one per token), which under-uses the GPU the same
+// way decode's single-token matvec does. This shader is the universal
+// fallback: real M>1 GEMM, works everywhere.
+//
+// WHY THIS EXISTS ALONGSIDE matvec_f32.comp (the GEGV path used for decode):
+// this is NOT a replacement for it. matvec_f32.comp's subgroup-per-row
+// reduction is a better algorithm shape specifically when M==1 — one
+// subgroup, one row, no shared memory, no barrier() at all. This shader's
+// shared-memory tiling is the right shape when M is large enough to fill
+// 16x16 tiles (prefill); at M==1 it still launches a full tile per 16
+// columns of output and wastes 15/16 of the work in the same way the
+// coop-matrix path does at M==1 (see that shader's header comment) — the
+// waste is smaller in magnitude here (no matrix-core underutilization,
+// just idle threads in the tile past the real M rows) but the shape is
+// the same lesson: this is a GEMM for prefill, not a GEMV replacement.
+//
+// BOUNDS: unlike matmul_coopmat_f16.comp, this does NOT require M, K, or N
+// to be multiples of the tile size — every shared-memory load and every
+// output store is bounds-checked against the real (unpadded) pc.M/pc.K/
+// pc.N, with out-of-range tile reads treated as 0. Callers can pass real,
+// unpadded prefill dimensions directly; no host-side padding needed
+// (contrast queue_matmul_f16(), which pads M itself for exactly this
+// reason — the coop-matrix hardware path doesn't get to bounds-check).
+//
+// VALIDATION STATUS: this is the standard textbook tiled-GEMM shape (every
+// GPGPU course teaches this exact pattern) and the indexing was traced by
+// hand for correctness, but — like matmul_coopmat_f16.comp — it has not
+// been run against a CPU reference. Do that before trusting it for
+// anything real; unlike the coop-matrix path, there's no hardware-support
+// question standing in the way of running that check on literally any
+// device this backend already targets, lavapipe included.
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BBuf { float b[]; }; // K x N, row-major — resident weights
+layout(set = 0, binding = 1) readonly buffer ABuf { float a[]; }; // M x K, row-major — per-call activations
+layout(set = 0, binding = 2) writeonly buffer CBuf { float c[]; }; // M x N, row-major — output
+
+layout(push_constant) uniform Push { uint M; uint K; uint N; } pc;
+
+const uint TILE = 16u;
+shared float tileA[TILE][TILE];
+shared float tileB[TILE][TILE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // this invocation's output row (0..M-1, may be out of range)
+    uint col = gl_GlobalInvocationID.x; // this invocation's output column (0..N-1, may be out of range)
+    uint lr = gl_LocalInvocationID.y;
+    uint lc = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    uint num_tiles = (pc.K + TILE - 1u) / TILE;
+
+    for (uint t = 0u; t < num_tiles; ++t) {
+        // Cooperative load: thread (lr,lc) loads A[row][t*TILE+lc] into
+        // tileA[lr][lc], and B[t*TILE+lr][col] into tileB[lr][lc]. Across
+        // the whole 16x16 workgroup this fills both tiles completely
+        // before any thread starts accumulating (the barrier() below).
+        uint a_col = t * TILE + lc;
+        uint b_row = t * TILE + lr;
+        tileA[lr][lc] = (row < pc.M && a_col < pc.K) ? a[row * pc.K + a_col] : 0.0;
+        tileB[lr][lc] = (b_row < pc.K && col < pc.N) ? b[b_row * pc.N + col] : 0.0;
+
+        barrier();
+
+        for (uint k = 0u; k < TILE; ++k)
+            acc += tileA[lr][k] * tileB[k][lc];
+
+        barrier(); // before the next iteration overwrites tileA/tileB
+    }
+
+    if (row < pc.M && col < pc.N)
+        c[row * pc.N + col] = acc;
+}

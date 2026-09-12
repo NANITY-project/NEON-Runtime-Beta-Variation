@@ -1,0 +1,125 @@
+#version 450
+// =============================================================================
+// matvec_q4_0.comp — fused Q4_0(weight) x Q8_0(activation) matvec, the GPU
+// counterpart of rawllm_simd_dispatch.hpp's simd::dot_q4_0_q8_0(). This is
+// the actual point of a "quantized GPU kernel" (per rawllm_vulkan.hpp's old
+// header comment listing this as a documented follow-up): the multi-hundred-
+// MB Q4_0 weight matrix is uploaded to the GPU ONCE, still packed, and never
+// dequantized to F32 anywhere — matching the on-disk block layout exactly
+// so no CPU-side pre-pass is needed:
+//
+//   Q4_0 weight block, 18 bytes: [ 2 bytes fp16 scale d ][ 16 bytes packed
+//   nibbles ] — 32 unsigned 4-bit values per block, byte i holds value i
+//   in bits [0:3] (paired with value i+16 in bits [4:7]), values are
+//   (nibble - 8) in the true weight domain.
+//
+//   Q8_0 activation block, per-block layout on the HOST side is split into
+//   three parallel float/int arrays (X_D, X_SUM, X_Q) rather than the
+//   on-disk 34-byte block, because the activation vector is re-quantized
+//   fresh every token and is tiny (cols floats, not rows*cols) — no reason
+//   to pay a repack-to-disk-layout cost for something this small. X_SUM is
+//   the per-block sum of the 32 quantized int8 activations, precomputed
+//   host-side once (see rawllm_simd_dispatch.hpp's dot_q4_0_q8_0 comment on
+//   why: it's identical for every one of the thousands of rows that share
+//   this activation block, so hoisting it out of the per-row loop is a
+//   real CPU-side win already applied there, and the same hoist applies
+//   here) and used for the "-8 per nibble" bias correction:
+//     isum_true = isum_uncentered - 8 * x_sum[block]
+//   (because sum_j (nibble_j - 8) * xq_j = sum_j nibble_j*xq_j - 8*sum_j xq_j,
+//   and x_sum[block] IS sum_j xq_j).
+//
+// Reduction shape: identical subgroup-per-row / subgroupAdd pattern as
+// matvec_f32.comp — see that file's header for the rationale. Blocks (not
+// individual weight bytes) are strided across the subgroup's lanes; each
+// lane fully resolves its own blocks' 32-wide nibble unpack + int8 dot
+// before subgroupAdd combines the per-lane partial sums. That's a coarser
+// partition than the CPU path's "1 thread iterates every block of a row"
+// but the right one at this granularity: splitting a single 18-byte block
+// across multiple lanes would mean sub-block synchronization for a payload
+// (16 bytes) smaller than one cache line already.
+//
+// Byte-addressing note: the weight buffer is declared as a uint[] (4-byte
+// words), not uint8_t[], to stay portable without VK_KHR_8bit_storage or
+// VK_EXT_shader_8bit_storage (neither is assumed present). readByte()
+// extracts one byte at an arbitrary byte offset via a shift+mask, which is
+// what lets an 18-byte, non-4-byte-aligned block stride work at all;
+// readHalf() composes two such bytes and reuses unpackHalf2x16 (a core
+// GLSL 4.5 builtin) to get the fp16->f32 conversion for free, matching
+// rawllm_common.hpp's f16_to_f32() bit-for-bit (both are IEEE-754 binary16
+// decodes; there is no rounding-mode ambiguity here since neither side
+// does arithmetic in half precision, just conversion).
+//
+// Contract:
+//   binding 0: W      — raw Q4_0-block bytes, rows*(cols/32)*18 bytes, as uint[]
+//   binding 1: X_Q     — int8 quantized activations widened to int, cols ints
+//   binding 2: X_D     — per-block activation scale, cols/32 floats
+//   binding 3: X_SUM   — per-block sum of X_Q, cols/32 ints
+//   binding 4: y       — output vector, rows floats (writeonly)
+//   push constants: { uint cols; uint rows; }
+//   dispatch: same rows_per_workgroup scheme as matvec_f32.comp.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer WBuf   { uint W[]; };
+layout(std430, binding = 1) readonly buffer XQBuf  { int X_Q[]; };
+layout(std430, binding = 2) readonly buffer XDBuf  { float X_D[]; };
+layout(std430, binding = 3) readonly buffer XSBuf  { int X_SUM[]; };
+layout(std430, binding = 4) writeonly buffer YBuf  { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+const uint BLOCK_BYTES = 18u; // 2 (fp16 scale) + 16 (32 packed nibbles)
+
+uint readByte(uint byteIdx) {
+    uint word = W[byteIdx >> 2u];
+    uint shift = (byteIdx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float readHalf(uint byteIdx) {
+    uint lo = readByte(byteIdx);
+    uint hi = readByte(byteIdx + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    if (row >= params.rows) return;
+
+    uint nb = params.cols / 32u;
+    uint row_byte_off = row * nb * BLOCK_BYTES;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint b = lane; b < nb; b += sg_size) {
+        uint blk = row_byte_off + b * BLOCK_BYTES;
+        float wd = readHalf(blk);
+        uint qs_off = blk + 2u;
+        uint act_off = b * 32u;
+
+        int isum = 0;
+        for (uint j = 0u; j < 16u; ++j) {
+            uint packed = readByte(qs_off + j);
+            int lo = int(packed & 0xFu);
+            int hi = int(packed >> 4u);
+            isum += lo * X_Q[act_off + j] + hi * X_Q[act_off + j + 16u];
+        }
+        isum -= 8 * X_SUM[b];
+
+        acc += wd * X_D[b] * float(isum);
+    }
+    acc = subgroupAdd(acc);
+
+    if (lane == 0u) {
+        Y[row] = acc;
+    }
+}

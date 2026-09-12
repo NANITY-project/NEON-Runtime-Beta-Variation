@@ -1647,16 +1647,21 @@ int main(int argc, char* argv[]) {
         // reports real device/shader availability instead of staying
         // untested dead code, but proj_all_positions() below still always
         // runs on the CPU thread pool — nothing here changes which path
-        // actual token generation takes. Routing real matvecs through this
-        // (deciding when GPU beats CPU for a given tensor size, handling the
-        // quantized-weight case the shader doesn't cover yet, the
-        // upload/readback cost model) is exactly the follow-up work
-        // rawllm_vulkan.hpp's header comment describes, not done here.
+        // actual token generation takes. F32/Q4_0/Q8_0 fused GPU kernels
+        // (with weight residency and batched multi-op submission) all
+        // exist now (rawllm_vulkan.hpp), plus an optional fp16
+        // cooperative-matrix GEMM path for prefill on hardware that
+        // supports it, but routing real matvecs through any of this —
+        // deciding when GPU beats CPU for a given tensor size, prefill-
+        // vs-decode dispatch, the upload/readback cost model at that
+        // point — is exactly the follow-up work rawllm_vulkan.hpp's
+        // header comment describes, not done here.
         VLOG("probing Vulkan devices");
         try {
-            static vk_backend::VulkanMatvecBackend vulkan_probe("shaders/matvec_f32.spv");
-            std::cerr << "[Hardware] Vulkan: compute device + matvec_f32 shader initialized "
-                          "(experimental — not yet used for generation).\n";
+            static vk_backend::VulkanMatvecBackend vulkan_probe("shaders");
+            std::cerr << "[Hardware] Vulkan: compute device + F32/Q4_0/Q8_0 matvec shaders "
+                          "initialized (experimental — not yet used for generation)"
+                       << (vulkan_probe.coop_matrix_supported() ? ", fp16 cooperative-matrix GEMM available.\n" : ".\n");
         } catch (const std::exception& e) {
             std::cerr << "[Hardware] Vulkan: unavailable (" << e.what() << "), running CPU-only.\n";
         }

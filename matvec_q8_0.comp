@@ -1,0 +1,93 @@
+#version 450
+// =============================================================================
+// matvec_q8_0.comp — fused Q8_0(weight) x Q8_0(activation) matvec, the GPU
+// counterpart of rawllm_simd_dispatch.hpp's simd::dot_q8_0_q8_0(). Simpler
+// than the Q4_0 kernel: no nibble unpack, no zero-point bias correction
+// (Q8_0 has no offset), straight signed-int8 x signed-int8 dot per block.
+//
+//   Q8_0 weight block, 34 bytes on disk: [ 2 bytes fp16 scale d ][ 32 bytes
+//   signed int8 values ] — this matches dequant_q8_0()'s layout in
+//   rawllm_forward.hpp exactly, so the weight buffer here is those bytes
+//   verbatim, uploaded once at model-load time and never touched again.
+//
+// Same subgroup-per-row / block-strided-across-lanes / subgroupAdd shape as
+// matvec_q4_0.comp — see that file's header comment for the full rationale;
+// only the per-block inner loop differs (plain int8 dot, no nibble unpack,
+// no bias term).
+//
+// Contract:
+//   binding 0: W      — raw Q8_0-block bytes, rows*(cols/32)*34 bytes, as uint[]
+//   binding 1: X_Q     — int8 quantized activations widened to int, cols ints
+//   binding 2: X_D     — per-block activation scale, cols/32 floats
+//   binding 3: X_SUM   — unused here (kept so the Q4_0/Q8_0 descriptor set
+//                        layout is identical and both pipelines can share
+//                        one VkDescriptorSetLayout / one update path)
+//   binding 4: y       — output vector, rows floats (writeonly)
+//   push constants: { uint cols; uint rows; }
+//   dispatch: same rows_per_workgroup scheme as matvec_f32.comp.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer WBuf   { uint W[]; };
+layout(std430, binding = 1) readonly buffer XQBuf  { int X_Q[]; };
+layout(std430, binding = 2) readonly buffer XDBuf  { float X_D[]; };
+layout(std430, binding = 3) readonly buffer XSBuf  { int X_SUM[]; }; // unused
+layout(std430, binding = 4) writeonly buffer YBuf  { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+const uint BLOCK_BYTES = 34u; // 2 (fp16 scale) + 32 (signed int8 values)
+
+uint readByte(uint byteIdx) {
+    uint word = W[byteIdx >> 2u];
+    uint shift = (byteIdx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float readHalf(uint byteIdx) {
+    uint lo = readByte(byteIdx);
+    uint hi = readByte(byteIdx + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+int toSigned(uint byteVal) {
+    return (byteVal >= 128u) ? int(byteVal) - 256 : int(byteVal);
+}
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    if (row >= params.rows) return;
+
+    uint nb = params.cols / 32u;
+    uint row_byte_off = row * nb * BLOCK_BYTES;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint b = lane; b < nb; b += sg_size) {
+        uint blk = row_byte_off + b * BLOCK_BYTES;
+        float wd = readHalf(blk);
+        uint qs_off = blk + 2u;
+        uint act_off = b * 32u;
+
+        int isum = 0;
+        for (uint j = 0u; j < 32u; ++j) {
+            isum += toSigned(readByte(qs_off + j)) * X_Q[act_off + j];
+        }
+
+        acc += wd * X_D[b] * float(isum);
+    }
+    acc = subgroupAdd(acc);
+
+    if (lane == 0u) {
+        Y[row] = acc;
+    }
+}
