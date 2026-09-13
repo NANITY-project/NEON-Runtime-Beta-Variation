@@ -17,7 +17,10 @@
 //
 // Contract:
 //   binding 0: W      — raw Q8_0-block bytes, rows*(cols/32)*34 bytes, as uint[]
-//   binding 1: X_Q     — int8 quantized activations widened to int, cols ints
+//   binding 1: X_Q     — int8 quantized activations, cols values. Widened to
+//                        int (portable build) or kept as int8_t (INT8_STORAGE
+//                        build, see #ifdef below) — rawllm_vulkan.hpp's
+//                        queue_matvec_quantized() picks upload size/format to match.
 //   binding 2: X_D     — per-block activation scale, cols/32 floats
 //   binding 3: X_SUM   — unused here (kept so the Q4_0/Q8_0 descriptor set
 //                        layout is identical and both pipelines can share
@@ -29,11 +32,22 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef INT8_STORAGE
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
 
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer WBuf   { uint W[]; };
+#ifdef INT8_STORAGE
+// See matvec_q4_0.comp's INT8_STORAGE comment — identical rationale,
+// capability requirements, and validation status, just for this
+// shader's X_Q. Compiled with -DINT8_STORAGE=1 into matvec_q8_0_int8.spv.
+layout(std430, binding = 1) readonly buffer XQBuf  { int8_t X_Q[]; };
+#else
 layout(std430, binding = 1) readonly buffer XQBuf  { int X_Q[]; };
+#endif
 layout(std430, binding = 2) readonly buffer XDBuf  { float X_D[]; };
 layout(std430, binding = 3) readonly buffer XSBuf  { int X_SUM[]; }; // unused
 layout(std430, binding = 4) writeonly buffer YBuf  { float Y[]; };
@@ -80,7 +94,7 @@ void main() {
 
         int isum = 0;
         for (uint j = 0u; j < 32u; ++j) {
-            isum += toSigned(readByte(qs_off + j)) * X_Q[act_off + j];
+            isum += toSigned(readByte(qs_off + j)) * int(X_Q[act_off + j]);
         }
 
         acc += wd * X_D[b] * float(isum);
