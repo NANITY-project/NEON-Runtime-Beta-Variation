@@ -333,6 +333,15 @@ inline void vk_check(VkResult r, const std::string& what) {
         throw std::runtime_error("rawllm_vulkan: " + what + " failed (VkResult=" + std::to_string((int)r) + ")");
 }
 
+// Cheap existence check, used only to decide between the dp4a and portable
+// SPIR-V variants below — NOT a substitute for read_spirv()'s own open/size
+// validation, which still runs (and still throws with a clear message) on
+// whichever path actually gets loaded.
+inline bool spirv_file_exists(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return f.good();
+}
+
 // Opaque handle to a weight tensor uploaded ONCE and kept resident on the
 // GPU (device-local when the device exposes pure device-local memory,
 // direct host-visible+device-local combined memory otherwise — e.g. every
@@ -608,7 +617,7 @@ public:
         upload(slot.x, x, (VkDeviceSize)cols * sizeof(float));
 
         VkPipeline pipe = vec4_ok ? pipeline_f32_ : pipeline_f32_scalar_;
-        update_descriptor_set3(slot.set, W.buf, slot.x.buf, slot.y.buf);
+        bind_descriptors3(pipeline_layout3_, slot.set, W.buf, slot.x.buf, slot.y.buf);
         record_dispatch(pipe, pipeline_layout3_, slot.set, cols, rows);
         pending_downloads_.push_back({&slot.y, y, (VkDeviceSize)rows * sizeof(float)});
     }
@@ -758,6 +767,35 @@ public:
     // either way.
     bool dot_product_supported() const { return dot_product_supported_; }
 
+    // True only if the device supports dp4a AND the accelerated .spv
+    // variants were actually found and loaded — see create_pipelines()'s
+    // comment. dot_product_supported() alone is NOT enough to know
+    // whether the quantized GEMM is actually running the fast kernels;
+    // check this too (or read dp4a_fallback_reason() when it's false but
+    // dot_product_supported() is true, to see why).
+    bool dp4a_pipelines_loaded() const {
+        return dot_product_supported_ && dp4a_fallback_reason_.empty();
+    }
+    const std::string& dp4a_fallback_reason() const { return dp4a_fallback_reason_; }
+
+    // True iff VK_KHR_push_descriptor is active — see push_descriptor_supported_'s
+    // comment. Informational; every queue_matvec_*()/queue_matmul_*() call
+    // works identically either way.
+    bool push_descriptor_supported() const { return push_descriptor_supported_; }
+
+    // True iff int8_activation_supported_ AND matvec_q4_0_int8.spv/
+    // matvec_q8_0_int8.spv were actually found and loaded — same
+    // "capable vs. actually loaded" split as dp4a_pipelines_loaded().
+    // When false but int8_activation_supported() is true, check
+    // int8_activation_fallback_reason() for why; queue_matvec_q4_0()/
+    // queue_matvec_q8_0() work identically either way, just uploading
+    // 4x more bytes per activation vector in the fallback case.
+    bool int8_activation_supported() const { return int8_activation_supported_; }
+    bool int8_activation_pipelines_loaded() const {
+        return int8_activation_supported_ && int8_activation_fallback_reason_.empty();
+    }
+    const std::string& int8_activation_fallback_reason() const { return int8_activation_fallback_reason_; }
+
     // One-time resident upload of a K x N row-major weight matrix,
     // converted to fp16 on the host (this backend has no on-disk fp16
     // format of its own; callers hold F32 or quantized weights, so
@@ -809,7 +847,7 @@ public:
         ensure_scratch(slot.y, (VkDeviceSize)Mp * N * sizeof(float));
         upload(slot.x, slot.f16_scratch.data(), (VkDeviceSize)Mp * K * sizeof(uint16_t));
 
-        update_descriptor_set3(slot.set, Wf16.buf, slot.x.buf, slot.y.buf);
+        bind_descriptors3(pipeline_layout_coopmat_, slot.set, Wf16.buf, slot.x.buf, slot.y.buf);
         record_dispatch_matmul(pipeline_matmul_f16_, pipeline_layout_coopmat_, slot.set, Mp, K, N, kCoopTile);
         // Row-major C means the true M rows are the first M*N floats,
         // contiguous, regardless of the Mp padding above — downloading
@@ -858,7 +896,7 @@ public:
         ensure_scratch(slot.y, (VkDeviceSize)M * N * sizeof(float));
         upload(slot.x, X, (VkDeviceSize)M * K * sizeof(float));
 
-        update_descriptor_set3(slot.set, W.buf, slot.x.buf, slot.y.buf);
+        bind_descriptors3(pipeline_layout_coopmat_, slot.set, W.buf, slot.x.buf, slot.y.buf);
         record_dispatch_matmul(pipeline_matmul_f32_, pipeline_layout_coopmat_, slot.set, M, K, N, kTileF32);
         pending_downloads_.push_back({&slot.y, Y, (VkDeviceSize)M * N * sizeof(float)});
     }
@@ -932,7 +970,7 @@ private:
         upload(slot.xd, xs_d, (VkDeviceSize)M * nb * sizeof(float));
         upload(slot.xsum, xs_sum, (VkDeviceSize)M * nb * sizeof(int32_t));
 
-        update_descriptor_set5(slot.set, W.buf, slot.xq.buf, slot.xd.buf, slot.xsum.buf, slot.y.buf);
+        bind_descriptors5(pipeline_layout5_mm_, slot.set, W.buf, slot.xq.buf, slot.xd.buf, slot.xsum.buf, slot.y.buf);
         record_dispatch_matmul(pipe, pipeline_layout5_mm_, slot.set, M, K, N, kTileQuant);
         pending_downloads_.push_back({&slot.y, Y, (VkDeviceSize)M * N * sizeof(float)});
     }
@@ -1006,6 +1044,34 @@ private:
     // matmul_tiled_q4_0/q8_0.spv variants create_pipelines() loads;
     // nothing else in this class branches on it.
     bool dot_product_supported_ = false;
+    // Set by create_pipelines() when dot_product_supported_ is true but
+    // the dp4a .spv files weren't found — see dp4a_pipelines_loaded().
+    std::string dp4a_fallback_reason_;
+
+    // True iff VK_KHR_push_descriptor is present with maxPushDescriptors
+    // >= 5 — see create_device_and_queue()'s comment. When true,
+    // create_descriptor_layouts() builds desc_set_layout3_/5_ with
+    // VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, no
+    // persistent VkDescriptorSet is ever allocated for them (skipped
+    // entirely in create_descriptor_pool_and_sets()), and
+    // bind_descriptors3()/bind_descriptors5() push descriptor writes
+    // directly into the command buffer at record time instead of calling
+    // vkUpdateDescriptorSets() against a pre-allocated set. Purely a CPU-
+    // side recording-cost optimization — same math, same synchronization,
+    // no caller-visible difference beyond removing one
+    // allocate/update/bind round trip per queued op.
+    bool push_descriptor_supported_ = false;
+    PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_ = nullptr;
+
+    // True iff VK_KHR_8bit_storage + VK_KHR_shader_float16_int8 are both
+    // present with storageBuffer8BitAccess/shaderInt8 — see
+    // create_device_and_queue()'s comment. Does NOT by itself mean the
+    // int8-storage GEVM pipelines got built — same two-step "capable vs.
+    // actually loaded" split as dp4a: check int8_activation_pipelines_loaded().
+    bool int8_activation_supported_ = false;
+    // Set by create_pipelines() when int8_activation_supported_ is true
+    // but matvec_q4_0_int8.spv/matvec_q8_0_int8.spv weren't found.
+    std::string int8_activation_fallback_reason_;
 
     // True iff VK_EXT_subgroup_size_control is present — lets
     // build_pipeline_specialized() pin matmul_coopmat_f16.comp's
@@ -1448,6 +1514,84 @@ private:
             push_chain(&sgSizeFeat);
             enabled_exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
         }
+
+        // ---- optional: VK_KHR_push_descriptor, to skip the persistent
+        // descriptor-set-plus-vkUpdateDescriptorSets dance entirely ----
+        // No VkPhysicalDeviceXxxFeatures struct exists for this one — it's
+        // a pure extension (no feature bit to enable), so the presence
+        // check IS the capability check. The one thing worth verifying
+        // beyond presence is VkPhysicalDevicePushDescriptorPropertiesKHR::
+        // maxPushDescriptors, since that's a *properties* (not features)
+        // struct queried via vkGetPhysicalDeviceProperties2 — every
+        // binding set in this file needs at most 5 (the quantized-GEMM
+        // layout: W, XQ, XD, XSUM, Y), so this is a generous floor, not a
+        // tight one; real implementations report values in the dozens.
+        bool push_descriptor_ext_present = false;
+        {
+            uint32_t ext_count = 0;
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &ext_count, nullptr);
+            std::vector<VkExtensionProperties> exts(ext_count);
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &ext_count, exts.data());
+            for (auto& e : exts)
+                if (std::strcmp(e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) { push_descriptor_ext_present = true; break; }
+        }
+        bool push_descriptor_ok = false;
+        if (push_descriptor_ext_present) {
+            VkPhysicalDevicePushDescriptorPropertiesKHR pushProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            props2.pNext = &pushProps;
+            vkGetPhysicalDeviceProperties2(phys_, &props2);
+            push_descriptor_ok = pushProps.maxPushDescriptors >= 5;
+        }
+        if (push_descriptor_ok) enabled_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+
+        // ---- optional: VK_KHR_8bit_storage + VK_KHR_shader_float16_int8,
+        // for true int8 activation upload in the Q4_0/Q8_0 GEVM path ----
+        // (point 12's sibling gap: queue_matvec_quantized() currently
+        // widens the caller's int8 x_q values to int32 host-side because
+        // the shader declares X_Q as a plain int[] — see that function's
+        // comment. This is what lets matvec_q4_0_int8.comp/
+        // matvec_q8_0_int8.comp declare X_Q as int8_t[] instead: a 4x
+        // reduction in that upload's size, same reasoning as
+        // upload_weight_f16() being worth it for weights.
+        //
+        // Two separate feature bits are actually required by the spec:
+        // shaderInt8 (lets int8_t exist as a shader type at all) from
+        // VK_KHR_shader_float16_int8, and storageBuffer8BitAccess (lets
+        // it specifically live in an SSBO) from VK_KHR_8bit_storage. Only
+        // the GEVM (matvec_q4_0/q8_0) shaders get an int8-storage variant
+        // this pass — the GEMM (matmul_tiled_q4_0/q8_0) path keeps its
+        // existing int32-widened X_Q for now; doing both would mean a
+        // 4-way shader variant matrix (dp4a x int8-storage) for one pass.
+        bool int8_storage_ext_present = false, int8_shader_ext_present = false;
+        {
+            uint32_t ext_count = 0;
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &ext_count, nullptr);
+            std::vector<VkExtensionProperties> exts(ext_count);
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &ext_count, exts.data());
+            for (auto& e : exts) {
+                if (std::strcmp(e.extensionName, VK_KHR_8BIT_STORAGE_EXTENSION_NAME) == 0) int8_storage_ext_present = true;
+                if (std::strcmp(e.extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0) int8_shader_ext_present = true;
+            }
+        }
+        VkPhysicalDevice8BitStorageFeaturesKHR int8StorageFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR};
+        VkPhysicalDeviceShaderFloat16Int8FeaturesKHR int8ShaderFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR};
+        bool int8_activation_ok = false;
+        if (int8_storage_ext_present && int8_shader_ext_present) {
+            int8StorageFeat.pNext = &int8ShaderFeat;
+            VkPhysicalDeviceFeatures2 feat2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            feat2.pNext = &int8StorageFeat;
+            vkGetPhysicalDeviceFeatures2(phys_, &feat2);
+            int8_activation_ok = int8StorageFeat.storageBuffer8BitAccess == VK_TRUE && int8ShaderFeat.shaderInt8 == VK_TRUE;
+        }
+        if (int8_activation_ok) {
+            int8StorageFeat.storageBuffer8BitAccess = VK_TRUE;
+            int8ShaderFeat.shaderInt8 = VK_TRUE;
+            int8StorageFeat.pNext = &int8ShaderFeat;
+            push_chain(&int8StorageFeat);
+            enabled_exts.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+            enabled_exts.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+        }
         dci.enabledExtensionCount = (uint32_t)enabled_exts.size();
         dci.ppEnabledExtensionNames = enabled_exts.empty() ? nullptr : enabled_exts.data();
 
@@ -1455,6 +1599,21 @@ private:
         vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
         coop_matrix_supported_ = coop_features_ok; // narrowed further by query_coop_matrix_shape() below
         dot_product_supported_ = dot_product_ok;
+        // Function pointer only exists to look up once the extension is
+        // actually enabled on the device — vkGetInstanceProcAddr would
+        // also work here but the device-level loader is preferred for a
+        // device-level extension. push_descriptor_supported_ requires
+        // BOTH the extension being enabled above AND this lookup
+        // succeeding — some loader configurations expose the symbol only
+        // for extensions actually enabled at vkCreateDevice() time, so a
+        // null result here without push_descriptor_ok would silently
+        // never happen, but checking both keeps the invariant explicit.
+        if (push_descriptor_ok) {
+            vkCmdPushDescriptorSetKHR_ = (PFN_vkCmdPushDescriptorSetKHR)
+                vkGetDeviceProcAddr(device_, "vkCmdPushDescriptorSetKHR");
+        }
+        push_descriptor_supported_ = push_descriptor_ok && vkCmdPushDescriptorSetKHR_ != nullptr;
+        int8_activation_supported_ = int8_activation_ok;
         subgroup_size_control_supported_ = subgroup_size_control_ok;
 
         VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1590,10 +1749,19 @@ private:
     }
 
     void create_descriptor_layouts() {
+        // See push_descriptor_supported_'s comment: when true, both
+        // layouts below are created PUSH-DESCRIPTOR-ONLY
+        // (VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) — no
+        // VkDescriptorSet can ever be allocated from a layout with this
+        // flag (vkAllocateDescriptorSets would fail), which is exactly
+        // why create_descriptor_pool_and_sets() skips pool/set creation
+        // entirely in that case rather than allocating sets nothing uses.
+        VkDescriptorSetLayoutCreateFlags layout_flags =
+            push_descriptor_supported_ ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
         {
             VkDescriptorSetLayoutBinding bindings[3] = { storage_binding(0), storage_binding(1), storage_binding(2) };
             VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            ci.bindingCount = 3; ci.pBindings = bindings;
+            ci.bindingCount = 3; ci.pBindings = bindings; ci.flags = layout_flags;
             vk_check(vkCreateDescriptorSetLayout(device_, &ci, nullptr, &desc_set_layout3_), "vkCreateDescriptorSetLayout(3)");
         }
         {
@@ -1601,7 +1769,7 @@ private:
                 storage_binding(0), storage_binding(1), storage_binding(2), storage_binding(3), storage_binding(4)
             };
             VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            ci.bindingCount = 5; ci.pBindings = bindings;
+            ci.bindingCount = 5; ci.pBindings = bindings; ci.flags = layout_flags;
             vk_check(vkCreateDescriptorSetLayout(device_, &ci, nullptr, &desc_set_layout5_), "vkCreateDescriptorSetLayout(5)");
         }
 
@@ -1729,8 +1897,32 @@ private:
         if (!dir.empty() && dir.back() != '/') dir += '/';
         pipeline_f32_        = build_pipeline(dir + "matvec_f32.spv",        pipeline_layout3_);
         pipeline_f32_scalar_ = build_pipeline(dir + "matvec_f32_scalar.spv", pipeline_layout3_);
-        pipeline_q4_0_       = build_pipeline(dir + "matvec_q4_0.spv",       pipeline_layout5_);
-        pipeline_q8_0_       = build_pipeline(dir + "matvec_q8_0.spv",       pipeline_layout5_);
+
+        // GEVM quantized pipelines (Q4_0/Q8_0): same self-healing
+        // capable-vs-actually-loaded fallback as the dp4a selection below
+        // — a device can correctly report int8 storage/shader support
+        // while matvec_q4_0_int8.spv/matvec_q8_0_int8.spv simply aren't
+        // present (built from matvec_q4_0.comp/matvec_q8_0.comp compiled
+        // with -DINT8_STORAGE=1; NOT yet run against real hardware, same
+        // caveat as every other newly-added variant in this file — see
+        // this file's header comment / VULKAN_BACKEND_NOTES.md).
+        std::string q4_0_gevm_variant = "matvec_q4_0.spv";
+        std::string q8_0_gevm_variant = "matvec_q8_0.spv";
+        if (int8_activation_supported_) {
+            const std::string q4_0_int8_path = dir + "matvec_q4_0_int8.spv";
+            const std::string q8_0_int8_path = dir + "matvec_q8_0_int8.spv";
+            if (spirv_file_exists(q4_0_int8_path) && spirv_file_exists(q8_0_int8_path)) {
+                q4_0_gevm_variant = "matvec_q4_0_int8.spv";
+                q8_0_gevm_variant = "matvec_q8_0_int8.spv";
+            } else {
+                int8_activation_fallback_reason_ = "device reports storageBuffer8BitAccess+shaderInt8 but "
+                    "matvec_q4_0_int8.spv/matvec_q8_0_int8.spv weren't found in '" + dir + "' — using the "
+                    "int32-widened-activation kernels instead. Compile matvec_q4_0.comp/matvec_q8_0.comp "
+                    "with -DINT8_STORAGE=1 to get the reduced-upload variant.";
+            }
+        }
+        pipeline_q4_0_       = build_pipeline(dir + q4_0_gevm_variant, pipeline_layout5_);
+        pipeline_q8_0_       = build_pipeline(dir + q8_0_gevm_variant, pipeline_layout5_);
         // Only attempted when the device actually supports it — a device
         // without VK_KHR_cooperative_matrix (or without the 16x16x16
         // fp16xfp16->f32 shape) never needs matmul_coopmat_f16.spv to
@@ -1754,13 +1946,63 @@ private:
         // comment (point 12) and matmul_tiled_q4_0.comp/matmul_tiled_
         // q8_0.comp's own header comments for what the two variants do
         // differently.
-        const std::string q4_0_variant = dot_product_supported_ ? "matmul_tiled_q4_0_dp4a.spv" : "matmul_tiled_q4_0.spv";
-        const std::string q8_0_variant = dot_product_supported_ ? "matmul_tiled_q8_0_dp4a.spv" : "matmul_tiled_q8_0.spv";
+        //
+        // Real fix for the toolchain gap documented in
+        // VULKAN_BACKEND_NOTES.md ("Known toolchain issue: dp4a shader
+        // variants don't compile here"): a device can correctly report
+        // VK_KHR_shader_integer_dot_product support while the *_dp4a.spv
+        // files simply don't exist on disk, because the build's glslang
+        // couldn't compile GL_EXT_shader_integer_dot_product. Previously
+        // that meant create_pipelines() unconditionally requested the
+        // dp4a path and crashed in read_spirv()/build_pipeline() — the
+        // only workaround was manually forcing dot_product_supported_ to
+        // false after construction. Now: only select the dp4a variant if
+        // BOTH the device supports it AND the compiled .spv is actually
+        // present; otherwise fall back to the portable build with no
+        // caller-visible difference beyond losing the dp4a speedup. This
+        // makes the class self-healing across a mixed fleet (some
+        // machines have a dp4a-capable glslang, some don't) without any
+        // global override.
+        std::string q4_0_variant = "matmul_tiled_q4_0.spv";
+        std::string q8_0_variant = "matmul_tiled_q8_0.spv";
+        if (dot_product_supported_) {
+            const std::string q4_0_dp4a_path = dir + "matmul_tiled_q4_0_dp4a.spv";
+            const std::string q8_0_dp4a_path = dir + "matmul_tiled_q8_0_dp4a.spv";
+            if (spirv_file_exists(q4_0_dp4a_path) && spirv_file_exists(q8_0_dp4a_path)) {
+                q4_0_variant = "matmul_tiled_q4_0_dp4a.spv";
+                q8_0_variant = "matmul_tiled_q8_0_dp4a.spv";
+            } else {
+                dp4a_fallback_reason_ = "device reports VK_KHR_shader_integer_dot_product but "
+                    "matmul_tiled_q4_0_dp4a.spv/matmul_tiled_q8_0_dp4a.spv weren't found in '" + dir +
+                    "' — using the portable (non-dp4a) kernels instead. Likely cause: glslang here can't "
+                    "parse GL_EXT_shader_integer_dot_product (see VULKAN_BACKEND_NOTES.md); rebuild "
+                    "glslang from source or use the LunarG Vulkan SDK's glslc to get the dp4a speedup.";
+            }
+        }
         pipeline_matmul_q4_0_ = build_pipeline(dir + q4_0_variant, pipeline_layout5_mm_);
         pipeline_matmul_q8_0_ = build_pipeline(dir + q8_0_variant, pipeline_layout5_mm_);
     }
 
     void create_descriptor_pool_and_sets() {
+        // Push-descriptor mode: desc_set_layout3_/5_ were created with
+        // VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, and a
+        // VkDescriptorSet can never be allocated from a layout with that
+        // flag — allocation would fail validation. Nothing to allocate:
+        // slots3_[f]/slots5_[f] are still resized (their x/y/xq/xd/xsum
+        // scratch buffers are used either way, allocated lazily by
+        // ensure_scratch() on first use), just with .set left at its
+        // default VK_NULL_HANDLE, which bind_descriptors3()/5() never
+        // touch in this mode. desc_pool_ stays VK_NULL_HANDLE; the
+        // destructor already guards its vkDestroyDescriptorPool() call on
+        // that.
+        if (push_descriptor_supported_) {
+            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                slots3_[f].resize(max_ops_per_batch_);
+                slots5_[f].resize(max_ops_per_batch_);
+            }
+            return;
+        }
+
         // max_ops_per_batch_ sets for layout3 (3 storage buffers each)
         // plus max_ops_per_batch_ sets for layout5 (5 storage buffers
         // each), PER double-buffer slot (kFramesInFlight of everything —
@@ -2192,30 +2434,64 @@ private:
         vkDestroySemaphore(device_, sem, nullptr);
     }
 
-    void update_descriptor_set3(VkDescriptorSet set, VkBuffer w, VkBuffer x, VkBuffer y) {
+    // Binds the 3-buffer (W, X, Y) descriptor set for the upcoming
+    // dispatch. Two modes, chosen once at device-creation time
+    // (push_descriptor_supported_), identical result either way:
+    //   - push mode: writes go straight into the command buffer via
+    //     vkCmdPushDescriptorSetKHR — no VkDescriptorSet object involved
+    //     at all (`set` is ignored, always VK_NULL_HANDLE from the
+    //     caller in this mode). Must be called with a batch open (same
+    //     precondition record_dispatch() already enforces) since this
+    //     records directly into cmd_[cur_].
+    //   - fallback mode: exactly the old update_descriptor_set3() body —
+    //     vkUpdateDescriptorSets() against the pre-allocated `set`, which
+    //     record_dispatch() then binds via vkCmdBindDescriptorSets().
+    // `layout` must be the SAME VkPipelineLayout the caller is about to
+    // bind the pipeline with (record_dispatch()'s `layout` parameter) —
+    // push descriptor writes are scoped to a specific pipeline layout's
+    // set-0 binding, not compatible-by-coincidence across different
+    // VkPipelineLayout objects even when built from the same
+    // VkDescriptorSetLayout (pipeline_layout3_ vs pipeline_layout_coopmat_
+    // is exactly that case — see queue_matmul_f16()/queue_matmul_f32()).
+    void bind_descriptors3(VkPipelineLayout layout, VkDescriptorSet set, VkBuffer w, VkBuffer x, VkBuffer y) {
         VkDescriptorBufferInfo infos[3] = { {w, 0, VK_WHOLE_SIZE}, {x, 0, VK_WHOLE_SIZE}, {y, 0, VK_WHOLE_SIZE} };
         VkWriteDescriptorSet writes[3]{};
         for (int i = 0; i < 3; ++i) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = set; writes[i].dstBinding = (uint32_t)i;
+            writes[i].dstBinding = (uint32_t)i;
             writes[i].descriptorCount = 1; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &infos[i];
         }
-        vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+        if (push_descriptor_supported_) {
+            writes[0].dstSet = writes[1].dstSet = writes[2].dstSet = VK_NULL_HANDLE; // ignored by vkCmdPushDescriptorSetKHR
+            vkCmdPushDescriptorSetKHR_(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 3, writes);
+        } else {
+            for (int i = 0; i < 3; ++i) writes[i].dstSet = set;
+            vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+        }
     }
 
-    void update_descriptor_set5(VkDescriptorSet set, VkBuffer w, VkBuffer xq, VkBuffer xd, VkBuffer xsum, VkBuffer y) {
+    // Same as bind_descriptors3() for the 5-buffer (W, XQ, XD, XSUM, Y)
+    // quantized layout — see that function's comment for the push-vs-
+    // fallback contract, which is identical here.
+    void bind_descriptors5(VkPipelineLayout layout, VkDescriptorSet set, VkBuffer w, VkBuffer xq, VkBuffer xd, VkBuffer xsum, VkBuffer y) {
         VkDescriptorBufferInfo infos[5] = {
             {w, 0, VK_WHOLE_SIZE}, {xq, 0, VK_WHOLE_SIZE}, {xd, 0, VK_WHOLE_SIZE}, {xsum, 0, VK_WHOLE_SIZE}, {y, 0, VK_WHOLE_SIZE}
         };
         VkWriteDescriptorSet writes[5]{};
         for (int i = 0; i < 5; ++i) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = set; writes[i].dstBinding = (uint32_t)i;
+            writes[i].dstBinding = (uint32_t)i;
             writes[i].descriptorCount = 1; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &infos[i];
         }
-        vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+        if (push_descriptor_supported_) {
+            for (int i = 0; i < 5; ++i) writes[i].dstSet = VK_NULL_HANDLE;
+            vkCmdPushDescriptorSetKHR_(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 5, writes);
+        } else {
+            for (int i = 0; i < 5; ++i) writes[i].dstSet = set;
+            vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+        }
     }
 
     // Records ONE dispatch into the currently-open batch's command buffer.
@@ -2228,7 +2504,12 @@ private:
     void record_dispatch(VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set, uint32_t cols, uint32_t rows) {
         if (!batch_open_) throw std::runtime_error("rawllm_vulkan: record_dispatch() called outside begin_batch()/end_batch()");
         vkCmdBindPipeline(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        vkCmdBindDescriptorSets(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        // Push-descriptor mode already bound set 0 via bind_descriptors3()/
+        // 5()'s vkCmdPushDescriptorSetKHR call, made by the caller just
+        // before this — `set` is VK_NULL_HANDLE in that mode and binding
+        // it here would be invalid, so skip entirely.
+        if (!push_descriptor_supported_)
+            vkCmdBindDescriptorSets(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         struct { uint32_t cols, rows; } push{cols, rows};
         vkCmdPushConstants(cmd_[cur_], layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
@@ -2250,7 +2531,8 @@ private:
     void record_dispatch_matmul(VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set, uint32_t M, uint32_t K, uint32_t N, uint32_t tile) {
         if (!batch_open_) throw std::runtime_error("rawllm_vulkan: record_dispatch_matmul() called outside begin_batch()/end_batch()");
         vkCmdBindPipeline(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        vkCmdBindDescriptorSets(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        if (!push_descriptor_supported_) // see record_dispatch()'s comment
+            vkCmdBindDescriptorSets(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
         struct { uint32_t M, K, N; } push{M, K, N};
         vkCmdPushConstants(cmd_[cur_], layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
@@ -2267,23 +2549,38 @@ private:
         uint32_t nb = cols / 32u;
         Layout5Slot& slot = next_slot5();
 
-        // Shaders declare X_Q as int[] (no 8-bit storage extension assumed
-        // — see shaders/matvec_q4_0.comp's header comment), so widen the
-        // int8 activation vector to int32 here. This is a cols-sized
-        // (not rows*cols-sized) host-side pass, done once per queued op.
-        slot.xq_widen.resize(cols);
-        for (uint32_t i = 0; i < cols; ++i) slot.xq_widen[i] = (int32_t)x_q[i];
+        // Shaders declare X_Q as int[] (portable build) or int8_t[]
+        // (INT8_STORAGE build — see matvec_q4_0.comp/matvec_q8_0.comp's
+        // header comments and int8_activation_supported()'s doc comment
+        // above). int8_activation_pipelines_loaded() tells us which
+        // pipeline create_pipelines() actually built `pipe` from — both
+        // q4_0 and q8_0 are always selected together (see
+        // create_pipelines()), so one check here covers both callers.
+        if (int8_activation_pipelines_loaded()) {
+            // No host-side copy needed at all: x_q is already exactly
+            // the bytes the shader wants, uploaded verbatim — a real 4x
+            // reduction versus the widen-to-int32 path below, not just a
+            // smaller widen loop.
+            ensure_scratch(slot.xq, (VkDeviceSize)cols * sizeof(int8_t));
+            upload(slot.xq, x_q, (VkDeviceSize)cols * sizeof(int8_t));
+        } else {
+            // Widen the int8 activation vector to int32 here. This is a
+            // cols-sized (not rows*cols-sized) host-side pass, done once
+            // per queued op.
+            slot.xq_widen.resize(cols);
+            for (uint32_t i = 0; i < cols; ++i) slot.xq_widen[i] = (int32_t)x_q[i];
+            ensure_scratch(slot.xq, (VkDeviceSize)cols * sizeof(int32_t));
+            upload(slot.xq, slot.xq_widen.data(), (VkDeviceSize)cols * sizeof(int32_t));
+        }
 
-        ensure_scratch(slot.xq, (VkDeviceSize)cols * sizeof(int32_t));
         ensure_scratch(slot.xd, (VkDeviceSize)nb * sizeof(float));
         ensure_scratch(slot.xsum, (VkDeviceSize)nb * sizeof(int32_t));
         ensure_scratch(slot.y, (VkDeviceSize)rows * sizeof(float));
 
-        upload(slot.xq, slot.xq_widen.data(), (VkDeviceSize)cols * sizeof(int32_t));
         upload(slot.xd, x_d, (VkDeviceSize)nb * sizeof(float));
         upload(slot.xsum, x_sum, (VkDeviceSize)nb * sizeof(int32_t));
 
-        update_descriptor_set5(slot.set, W.buf, slot.xq.buf, slot.xd.buf, slot.xsum.buf, slot.y.buf);
+        bind_descriptors5(pipeline_layout5_, slot.set, W.buf, slot.xq.buf, slot.xd.buf, slot.xsum.buf, slot.y.buf);
         record_dispatch(pipe, pipeline_layout5_, slot.set, cols, rows);
         pending_downloads_.push_back({&slot.y, y, (VkDeviceSize)rows * sizeof(float)});
     }
