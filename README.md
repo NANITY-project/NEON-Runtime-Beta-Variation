@@ -46,12 +46,29 @@ full "why" and the exact tensor/metadata contract.
   `--idle-compression=text` works today (the model summarizes its own
   outgoing chunk, no training needed). `--idle-compression=slots` (reserved
   KV-row compression, à la Gist Tokens/AutoCompressors/ICAE) has its core
-  cache primitive (`kv_cache_compact()` in `rawllm_forward.hpp`, unit-tested
-  in `test_kv_cache_compact.cpp`) but is not wired into the idle loop yet —
-  see that function's doc comment for what training/masking work is still
-  needed before it produces anything but noise.
+  cache primitive (`kv_cache_compact()` in `rawllm_forward.hpp`) but is not
+  wired into the idle loop yet — see that function's doc comment for what
+  training/masking work is still needed before it produces anything but
+  noise. (No standalone test harness for it ships on this branch.)
 
 ## Known limitations
+
+- **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
+  gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
+  descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
+  against a software Vulkan implementation (Mesa lavapipe) across a range of
+  matrix sizes including realistic transformer-layer dimensions — but **not
+  yet exercised on real GPU hardware**, and **not wired into the actual
+  generation hot path**: `--model ... --probe` with a Vulkan-enabled build
+  will initialize the backend and log whether a usable device was found,
+  but every token is still computed on the CPU path
+  (`rawllm_simd_dispatch.hpp`) regardless. Only F32 weights are covered;
+  quantized (Q4_0/Q8_0/K-quant) tensors would need a per-row dequant step
+  before this shader could touch them, which is real added cost the
+  CPU-side fused int8 kernels don't pay — deciding when that trade-off is
+  worth it, and actually routing `proj_all_positions()` through the GPU for
+  it, is the next piece of work here, not something this header claims to
+  do yet.
 
 **NCTR** Nctr is still not wired in. NCTRloader currently
 does not fully replace NEON's GGUFloader. However, it may be added in v0.3
@@ -163,24 +180,26 @@ install needs may differ from a generic example:
 hipcc -std=c++20 -O2 -pthread -DUSE_ROCBLAS -DUSE_ROCM NEON-3.cpp -lrocblas -lamdhip64 -o neon
 ```
 
-Vulkan build (experimental, see above — needs the Vulkan SDK loader/headers
-and a compiled shader):
+Vulkan build (experimental — see `rawllm_vulkan.hpp` and
+[Known limitations](#known-limitations) above). The `.comp` shader
+sources, the compiled-`.spv` build recipe, and the standalone test
+harnesses for this backend all live on the **`VULKAN-EXPERIMENTAL`**
+branch, not here — `main` ships `rawllm_vulkan.hpp` itself (so `-DUSE_VULKAN`
+compiles) but no shader sources to build against it. Switch branches for
+the Vulkan-specific guide:
 ```
-glslangValidator -V shaders/matvec_f32.comp -o shaders/matvec_f32.spv
+git checkout VULKAN-EXPERIMENTAL
+```
+On `main`, `NEON-3.cpp -DUSE_VULKAN --probe` will compile and run, but
+`VulkanMatvecBackend` construction is wrapped in a try/catch — with no
+`.spv` files to find, it prints `[Hardware] Vulkan: unavailable (...)` and
+falls back to CPU rather than failing the build:
+```
 g++ -std=c++20 -O2 -pthread -DUSE_VULKAN NEON-3.cpp -lvulkan -o neon
 ```
 
 ## Testing
 
-`test_kv_cache_compact.cpp` is a standalone unit test for
-`kv_cache_compact()` (the zRAM-tier cache primitive in
-`rawllm_forward.hpp`) — it needs no model weights, since it drives the
-cache directly with synthetic tagged rows and checks the resulting memory
-layout:
-```
-g++ -std=c++20 -O0 -g -pthread test_kv_cache_compact.cpp -o test_kv_cache_compact
-./test_kv_cache_compact
-```
 `test_nctr_loader.cpp` is a standalone smoke test for the `.nctr` loader
 (`rawllm_nctr_loader.hpp`) — it takes a `.nctr` file to load and validate:
 ```
@@ -224,24 +243,72 @@ in this repo is meant to be worked through hands-on, not studied first.
 
 ## Repository layout
 
+This is every file on the `main` branch, grouped by what it's for. (The
+Vulkan `.comp` shader sources and their standalone test harnesses live on
+the `VULKAN-EXPERIMENTAL` branch — see [Build](#build) above.)
+
+**Core runtime**
+
 | File | What it is |
 |---|---|
 | `NEON-3.cpp` | The runtime itself — CLI, generation loop, tokenizer, model-format dispatch |
 | `rawllm_loader.hpp` | GGUF loader |
 | `rawllm_nctr_loader.hpp` | `.nctr` loader (parsing works; not yet wired into inference) |
-| `rawllm_forward.hpp` | Transformer forward pass — attention, RoPE, GQA, SwiGLU |
-| `rawllm_rocm.hpp` | ROCm/HIP backend (optional) |
-| `rawllm_common.hpp`, `rawllm_util.hpp`, `rawllm_json.hpp` | Shared utilities |
-| `nectar_diskmem.hpp`, `nectar_vision.hpp`, `nectar_splice.hpp` | Idle-loop companion-overlay modules (optional feature) |
-| `nectar_zram.hpp` | Idle-loop zRAM tier — chunk-pointer ring buffer + pluggable compression backend (optional feature) |
-| `nanity_convert.py` | Converts third-party GGUF models into NANITY-conformant GGUF |
+| `rawllm_forward.hpp` | Transformer forward pass — attention, RoPE, GQA, SwiGLU, KV cache (incl. `kv_cache_compact()`, the zRAM-tier primitive) |
+| `rawllm_common.hpp` | Shared types/helpers used across loaders and the forward pass |
+| `rawllm_util.hpp` | Small standalone utilities (no dependencies on the rest of the engine) |
+| `rawllm_json.hpp` | Minimal JSON parsing/writing used for `--interactive`'s request/response format |
+
+**CPU SIMD backends** (see "CPU SIMD backends" above for how these fit together)
+
+| File | What it is |
+|---|---|
+| `rawllm_simd_scalar.hpp` | Portable fallback + correctness reference for every vectorized backend |
+| `rawllm_simd_avx2.hpp` | AVX2+FMA dot-product / fused-quantized-dot kernels |
+| `rawllm_simd_avx512.hpp` | AVX-512 kernels, with an AVX-512-VNNI fast path |
+| `rawllm_simd_dispatch.hpp` | Picks AVX-512 > AVX2 > scalar at compile time; the only one of the four `rawllm_forward.hpp` includes |
+
+**GPU backends (optional)**
+
+| File | What it is |
+|---|---|
+| `rawllm_rocm.hpp` | ROCm/HIP backend (AMD MI300X target) |
+| `rawllm_vulkan.hpp` | Vulkan compute backend (experimental, F32/Q4_0/Q8_0 matvec + F32/F16 matmul). Compiles here under `-DUSE_VULKAN`; the shader sources and build/test workflow are on `VULKAN-EXPERIMENTAL` |
+
+**Idle-loop / companion-overlay (optional feature, `-DNANITY_ENABLE_IDLE_LOOP`)**
+
+| File | What it is |
+|---|---|
+| `nectar_diskmem.hpp` | Disk-backed context eviction |
+| `nectar_vision.hpp` | Hyprland vision hooks |
+| `nectar_splice.hpp` | Idle-loop generation splicing |
+| `nectar_zram.hpp` | zRAM compression tier — chunk-pointer ring buffer + pluggable compression backend |
+
+**Training & conversion pipeline**
+
+| File | What it is |
+|---|---|
+| `nanity_convert.py` | Converts third-party GGUF models into NANITY-conformant GGUF (`--detect-only` to check compatibility first) |
 | `nanity_data_format.py` | `.nctr` container format definitions |
 | `train_nanity_fixed.py` | Training pipeline + `export_gguf()` / `export_nctr()` |
 | `modeling_nanity.py` | Reference PyTorch implementation of the NANITY architecture |
 | `prepare_data.py` | Training data preparation |
-| `test_nctr_loader.cpp` | Standalone `.nctr` loader smoke test |
-| `test_kv_cache_compact.cpp` | Standalone unit test for `kv_cache_compact()`'s memmove/index bookkeeping (no model weights needed — see "Testing" below) |
+
+**Tests**
+
+| File | What it is |
+|---|---|
+| `test_nctr_loader.cpp` | Standalone smoke test for the `.nctr` loader — takes a `.nctr` file to load and validate (see "Testing" above) |
+
+**Docs & project meta**
+
+| File | What it is |
+|---|---|
 | `NANITY_ARCHITECTURE_SPEC.md` | The spec itself — read this for the full technical contract |
+| `VULKAN_BACKEND_NOTES.md` | Vulkan backend perf-work log and first real-hardware (NVIDIA T4) validation notes. Written against the `VULKAN-EXPERIMENTAL` branch's file layout — see that branch's README for the current build/test guide |
+| `CONTRIBUTING.md` | How to contribute — read before sending a PR, especially the backend-review notes |
+| `SECURITY.md` | Vulnerability reporting policy (solo-maintained, best-effort, no SLA) |
+| `LICENSE` | Source-available license — current terms during the prototyping phase |
 | `nanity.html` | Project website |
 
 ## License
