@@ -53,23 +53,6 @@ full "why" and the exact tensor/metadata contract.
 
 ## Known limitations
 
-- **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
-  gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
-  descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
-  against a software Vulkan implementation (Mesa lavapipe) across a range of
-  matrix sizes including realistic transformer-layer dimensions — but **not
-  yet exercised on real GPU hardware**, and **not wired into the actual
-  generation hot path**: `--model ... --probe` with a Vulkan-enabled build
-  will initialize the backend and log whether a usable device was found,
-  but every token is still computed on the CPU path
-  (`rawllm_simd_dispatch.hpp`) regardless. Only F32 weights are covered;
-  quantized (Q4_0/Q8_0/K-quant) tensors would need a per-row dequant step
-  before this shader could touch them, which is real added cost the
-  CPU-side fused int8 kernels don't pay — deciding when that trade-off is
-  worth it, and actually routing `proj_all_positions()` through the GPU for
-  it, is the next piece of work here, not something this header claims to
-  do yet.
-
 **NCTR** Nctr is still not wired in. NCTRloader currently
 does not fully replace NEON's GGUFloader. However, it may be added in v0.3
 or later.
