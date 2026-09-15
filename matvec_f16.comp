@@ -1,0 +1,90 @@
+#version 450
+// =============================================================================
+// matvec_f16.comp — EXPERIMENTAL, NOT YET WIRED OR TESTED ON HARDWARE.
+//
+// GEMV is memory-bandwidth bound, not compute bound: at M=1 there is only
+// ever one activation vector to reuse, so total runtime is dominated by how
+// many bytes of W have to move from VRAM per token. matvec_f32.comp already
+// keeps W resident (uploaded once, never re-transferred), but each row is
+// still 4 bytes/element. This shader reads the SAME resident-weight-tensor
+// idea but expects W already converted to fp16 host-side (rawllm_vulkan.hpp
+// already has upload_weight_f16() for the coop-matrix GEMM path — reusable
+// as-is for this GEMV shader too, see the .hpp diff), halving the bytes/row
+// moved versus matvec_f32.comp for models that can tolerate fp16 weights on
+// the GPU (same fp16 the CPU path already uses nowhere — this is a
+// GPU-only precision tier, independent of what's resident on the CPU side).
+//
+// This is NOT the same thing as the coop-matrix fp16 GEMM path
+// (matmul_coopmat_f16.comp): that one uses tensor/matrix cores for a
+// prefill-shaped (M>1) matmul and explicitly documents itself as wasteful
+// at M=1. This shader is a plain subgroup-per-row GEMV — the coop-matrix
+// hardware path doesn't apply at M=1 at all, so decode-time fp16 weight
+// bandwidth savings have to come from a shader like this one instead.
+//
+// Same subgroup-per-row / subgroupAdd shape as matvec_f32.comp — see that
+// file's header for the full rationale. Loads are packed as uvec4 (8 fp16
+// values/lane/iteration via 4x unpackHalf2x16) to keep the vectorized load
+// width matvec_f32.comp uses; accumulation itself stays in f32 throughout
+// (unpackHalf2x16 converts to f32 immediately, so there is no f16
+// intermediate arithmetic or associated precision loss beyond the weight
+// storage format itself).
+//
+// Contract (mirrors matvec_f32.comp, only W's storage type differs):
+//   binding 0: W  — row-major fp16 matrix (from upload_weight_f16()),
+//                   reinterpreted as uvec4[rows*cols/8] (8 halves/uvec4)
+//   binding 1: x  — shared activation vector, f32, reinterpreted as vec4[cols/4]
+//   binding 2: y  — output vector, rows floats (writeonly)
+//   push constants: { uint cols; uint rows; }
+//   dispatch: identical rows_per_workgroup scheme as matvec_f32.comp.
+// Host guarantees cols % 8 == 0 (true for every realistic transformer
+// hidden size) — no scalar fallback shipped for this experimental shader
+// yet; add one (mirroring matvec_f32_scalar.comp) before using this on a
+// model with a cols not divisible by 8.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly restrict buffer WBuf { uvec4 Wh[]; }; // 8 fp16/uvec4
+layout(std430, binding = 1) readonly restrict buffer XBuf { vec4 Xv[]; };  // 4 f32/vec4
+layout(std430, binding = 2) writeonly restrict buffer YBuf { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    if (row >= params.rows) return;
+
+    uint vec8_cols = params.cols >> 3u; // cols/8, host guarantees cols % 8 == 0
+    uint row_off = row * vec8_cols;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint j = lane; j < vec8_cols; j += sg_size) {
+        uvec4 wpacked = Wh[row_off + j];
+        vec2 w01 = unpackHalf2x16(wpacked.x);
+        vec2 w23 = unpackHalf2x16(wpacked.y);
+        vec2 w45 = unpackHalf2x16(wpacked.z);
+        vec2 w67 = unpackHalf2x16(wpacked.w);
+
+        // Two consecutive vec4 activation loads cover the same 8 elements
+        // this uvec4 weight load spans.
+        vec4 xa = Xv[j * 2u];
+        vec4 xb = Xv[j * 2u + 1u];
+
+        acc += w01.x * xa.x + w01.y * xa.y + w23.x * xa.z + w23.y * xa.w;
+        acc += w45.x * xb.x + w45.y * xb.y + w67.x * xb.z + w67.y * xb.w;
+    }
+    acc = subgroupAdd(acc);
+
+    if (lane == 0u) {
+        Y[row] = acc;
+    }
+}

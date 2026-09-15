@@ -1,0 +1,125 @@
+#version 450
+// =============================================================================
+// matvec_q8_0.comp — fused Q8_0(weight) x Q8_0(activation) matvec, the GPU
+// counterpart of rawllm_simd_dispatch.hpp's simd::dot_q8_0_q8_0(). Simpler
+// than the Q4_0 kernel: no nibble unpack, no zero-point bias correction
+// (Q8_0 has no offset), straight signed-int8 x signed-int8 dot per block.
+//
+//   Q8_0 weight block, 34 bytes on disk: [ 2 bytes fp16 scale d ][ 32 bytes
+//   signed int8 values ] — this matches dequant_q8_0()'s layout in
+//   rawllm_forward.hpp exactly, so the weight buffer here is those bytes
+//   verbatim, uploaded once at model-load time and never touched again.
+//
+// Same subgroup-per-row / block-strided-across-lanes / subgroupAdd shape as
+// matvec_q4_0.comp — see that file's header comment for the full rationale;
+// only the per-block inner loop differs (plain int8 dot, no nibble unpack,
+// no bias term).
+//
+// Contract:
+//   binding 0: W      — raw Q8_0-block bytes, rows*(cols/32)*34 bytes, as uint[]
+//   binding 1: X_Q     — int8 quantized activations, cols values. Widened to
+//                        int (portable build) or kept as int8_t (INT8_STORAGE
+//                        build, see #ifdef below) — rawllm_vulkan.hpp's
+//                        queue_matvec_quantized() picks upload size/format to match.
+//   binding 2: X_D     — per-block activation scale, cols/32 floats
+//   binding 3: X_SUM   — unused here (kept so the Q4_0/Q8_0 descriptor set
+//                        layout is identical and both pipelines can share
+//                        one VkDescriptorSetLayout / one update path)
+//   binding 4: y       — output vector, rows floats (writeonly)
+//   push constants: { uint cols; uint rows; }
+//   dispatch: same rows_per_workgroup scheme as matvec_f32.comp.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef INT8_STORAGE
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+
+layout(local_size_x = 256) in;
+
+// EXPERIMENTAL: restrict — see matvec_f32.comp's header for the rationale.
+layout(std430, binding = 0) readonly restrict buffer WBuf   { uint W[]; };
+#ifdef INT8_STORAGE
+// See matvec_q4_0.comp's INT8_STORAGE comment — identical rationale,
+// capability requirements, and validation status, just for this
+// shader's X_Q. Compiled with -DINT8_STORAGE=1 into matvec_q8_0_int8.spv.
+layout(std430, binding = 1) readonly restrict buffer XQBuf  { int8_t X_Q[]; };
+#else
+layout(std430, binding = 1) readonly restrict buffer XQBuf  { int X_Q[]; };
+#endif
+layout(std430, binding = 2) readonly restrict buffer XDBuf  { float X_D[]; };
+layout(std430, binding = 3) readonly restrict buffer XSBuf  { int X_SUM[]; }; // unused
+layout(std430, binding = 4) writeonly restrict buffer YBuf  { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+const uint BLOCK_BYTES = 34u; // 2 (fp16 scale) + 32 (signed int8 values)
+
+uint readByte(uint byteIdx) {
+    uint word = W[byteIdx >> 2u];
+    uint shift = (byteIdx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float readHalf(uint byteIdx) {
+    uint lo = readByte(byteIdx);
+    uint hi = readByte(byteIdx + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+int toSigned(uint byteVal) {
+    return (byteVal >= 128u) ? int(byteVal) - 256 : int(byteVal);
+}
+
+// EXPERIMENTAL: same rationale/caveat as matvec_q4_0.comp's readWord4() —
+// composes an arbitrarily-aligned 4-byte little-endian word from at most 2
+// loads instead of 4 separate readByte() calls.
+uint readWord4(uint byteIdx) {
+    uint w0 = W[byteIdx >> 2u];
+    uint shift = (byteIdx & 3u) * 8u;
+    if (shift == 0u) return w0;
+    uint w1 = W[(byteIdx >> 2u) + 1u];
+    return (w0 >> shift) | (w1 << (32u - shift));
+}
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups;
+    uint row = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    if (row >= params.rows) return;
+
+    uint nb = params.cols / 32u;
+    uint row_byte_off = row * nb * BLOCK_BYTES;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    float acc = 0.0;
+    for (uint b = lane; b < nb; b += sg_size) {
+        uint blk = row_byte_off + b * BLOCK_BYTES;
+        float wd = readHalf(blk);
+        uint qs_off = blk + 2u;
+        uint act_off = b * 32u;
+
+        // EXPERIMENTAL: 4-at-a-time via readWord4() — see matvec_q4_0.comp's
+        // readWord4() header comment for the rationale/caveat.
+        int isum = 0;
+        for (uint j4 = 0u; j4 < 32u; j4 += 4u) {
+            uint w = readWord4(qs_off + j4);
+            for (uint k = 0u; k < 4u; ++k) {
+                uint packed = (w >> (k * 8u)) & 0xFFu;
+                isum += toSigned(packed) * int(X_Q[act_off + j4 + k]);
+            }
+        }
+
+        acc += wd * X_D[b] * float(isum);
+    }
+    acc = subgroupAdd(acc);
+
+    if (lane == 0u) {
+        Y[row] = acc;
+    }
+}

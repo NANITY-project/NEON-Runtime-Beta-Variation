@@ -1,0 +1,101 @@
+#version 450
+// =============================================================================
+// matvec_f32_x2.comp — EXPERIMENTAL, NOT YET TESTED ON HARDWARE.
+//
+// matvec_f32.comp gives each subgroup ONE row; every lane in that subgroup
+// re-reads the same slice of X another subgroup (working a different row)
+// is ALSO reading concurrently. That redundancy is fine when X fits in
+// L1/L2 (typical for a transformer hidden size), but each subgroup still
+// pays its own loop-control/load-issue overhead per row.
+//
+// This variant gives each subgroup TWO consecutive rows instead of one:
+// every lane loads its slice of X ONCE per loop iteration and reuses it for
+// both rows' weight dot products, cutting X loads in half per row produced
+// and halving loop-control overhead per row (the loop itself runs the same
+// number of iterations but now retires 2 rows' worth of FMA per iteration
+// instead of 1). Whether this is a net win depends on whether the baseline
+// was actually X-load-bound or W-load-bound on the target device — filed
+// as experimental/unsure for exactly that reason; the two matvec_f32.comp
+// and matvec_f32_x2.comp pipelines can be A/B'd directly against each
+// other since they share the same weight tensor and descriptor layout.
+//
+// Row indexing changes from matvec_f32.comp: this shader's dispatch grid
+// must be computed as ceil(rows / (rows_per_workgroup * 2)) — see
+// record_dispatch_x2() in rawllm_vulkan.hpp — NOT the plain
+// rows_per_workgroup used by matvec_f32.comp/record_dispatch(). Mixing
+// this shader up with the plain record_dispatch() dispatch-count formula
+// will silently under-dispatch and leave the tail of the output vector
+// uncomputed (stale/garbage Y values) — this is exactly the kind of bug
+// class an "experimental, untested" shader is expected to carry until a
+// real run against real hardware exercises the ragged-row-count tail
+// (odd `rows`, or rows not a multiple of rows_per_workgroup*2).
+//
+// Contract:
+//   binding 0: W  — same layout as matvec_f32.comp
+//   binding 1: x  — same layout as matvec_f32.comp
+//   binding 2: y  — same layout as matvec_f32.comp
+//   push constants: { uint cols; uint rows; } — same as matvec_f32.comp
+//   dispatch: vkCmdDispatch(ceil(rows / (rows_per_wg * 2)), 1, 1) —
+//             see record_dispatch_x2()'s comment in rawllm_vulkan.hpp.
+// Host guarantees cols % 4 == 0 (no scalar fallback shipped for this
+// experimental shader — reuse matvec_f32_scalar.comp's plain path if a
+// model needs cols % 4 != 0 with this row-doubling scheme; not written
+// here to keep this first experimental cut small).
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly restrict buffer WBuf { vec4 Wv[]; };
+layout(std430, binding = 1) readonly restrict buffer XBuf { vec4 Xv[]; };
+layout(std430, binding = 2) writeonly restrict buffer YBuf { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+void main() {
+    uint rows_per_wg = gl_NumSubgroups; // subgroups per workgroup, each handling 2 rows
+    uint row_pair = gl_WorkGroupID.x * rows_per_wg + gl_SubgroupID;
+    uint row0 = row_pair * 2u;
+    uint row1 = row0 + 1u;
+    if (row0 >= params.rows) return;
+    bool has_row1 = (row1 < params.rows); // uniform across the whole subgroup (depends only on row0)
+
+    uint vec_cols = params.cols >> 2u;
+    uint row0_off = row0 * vec_cols;
+    uint row1_off = row1 * vec_cols; // only read from when has_row1 is true
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    vec4 acc0 = vec4(0.0);
+    vec4 acc1 = vec4(0.0);
+    if (has_row1) {
+        for (uint j = lane; j < vec_cols; j += sg_size) {
+            vec4 xv = Xv[j]; // loaded once, reused for both rows
+            acc0 += Wv[row0_off + j] * xv;
+            acc1 += Wv[row1_off + j] * xv;
+        }
+    } else {
+        // Tail case: only one row left in this dispatch. Falls back to
+        // exactly matvec_f32.comp's single-row loop so the last odd row
+        // (when `rows` isn't a multiple of rows_per_workgroup*2) isn't
+        // wasting a redundant second weight load that would never be used.
+        for (uint j = lane; j < vec_cols; j += sg_size) {
+            acc0 += Wv[row0_off + j] * Xv[j];
+        }
+    }
+
+    float sum0 = subgroupAdd(acc0.x + acc0.y + acc0.z + acc0.w);
+    if (lane == 0u) Y[row0] = sum0;
+
+    // subgroupAdd must be called uniformly by every active lane; has_row1
+    // is uniform across the subgroup (see above) so this branch is safe.
+    if (has_row1) {
+        float sum1 = subgroupAdd(acc1.x + acc1.y + acc1.z + acc1.w);
+        if (lane == 0u) Y[row1] = sum1;
+    }
+}
