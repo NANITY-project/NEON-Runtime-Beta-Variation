@@ -1,317 +1,150 @@
-NEON — NANITY Runtime (Beta)
+# NEON — Vulkan compute backend (experimental)
 
-A from-scratch C++ inference runtime for **NANITY**, a single fixed
-transformer architecture — not a GGUF-guessing nor every-architecture
-runtime like llama.cpp. NEON loads exactly one thing: a model that
-declares `general.architecture = "nanity"`, either as GGUF or as
-[`.nctr`](./NANITY_ARCHITECTURE_SPEC.md), NANITY's own container
-format. Everything else — training pipeline, GGUF/.nctr conversion, the
-spec itself — is designed around that one fixed shape on purpose. See
-[`NANITY_ARCHITECTURE_SPEC.md`](./NANITY_ARCHITECTURE_SPEC.md) for the
-full "why" and the exact tensor/metadata contract.
+This branch is `main` plus everything needed to build and exercise
+`rawllm_vulkan.hpp`, NEON's experimental Vulkan compute backend: the
+`.comp` shader sources and the standalone Vulkan/CPU/CUDA test harnesses.
+For the runtime itself, the model format, training, and general
+build/usage docs, see `main`'s README — this one only covers the
+Vulkan-specific pieces that live on this branch.
 
-> **Status: beta, source-available ** See
-> [`LICENSE`](./LICENSE) for current terms during the prototyping phase.
+> **Status:** experimental, matvec-only, validated on real GPU hardware
+> (NVIDIA T4) — see "What's validated vs. not" below.
 
-## What's actually working right now
+This backend is deliberately **matvec-only, no GEMM/batched path**. NEON
+is a single-user, single-prompt runtime — there's no batching workload
+here that a GEMM kernel would actually serve, so that surface was
+removed rather than carried as unused complexity.
 
-- **CPU inference**, no ROCm/GPU required to build or run — validated
-  end-to-end against real converted models (Llama-3.2-family and
-  TinyLlama-family architectures load and generate coherent output).
-- **GGUF loading**, including NANITY-converted third-party models via
-  [`nanity_convert.py`](./nanity_convert.py) (see its `--detect-only` flag
-  to check compatibility before converting anything).
-- **`.nctr` parsing** (`rawllm_nctr_loader.hpp` / `NCTRLoader`) — reads and
-  validates `.nctr` files standalone. **Not yet wired into the inference
-  path** — `ModelWeights`/`transformer_forward`/etc. still take
-  `GGUFLoader` concretely; see the integration TODO at the bottom of
-  `rawllm_nctr_loader.hpp`. `.nctr` export (`train_nanity_fixed.py`'s
-  `export_nctr()`) works; running a `.nctr` file through NEON doesn't, yet.
-- **Tokenization**: both byte-level BPE (GPT-2/tiktoken-family — Qwen,
-  Llama-3, Phi) and SentencePiece (Llama/TinyLlama-family) vocabularies.
-- **Idle-loop / companion-overlay mode** (continuous background generation,
-  disk-backed context eviction, Hyprland vision hooks) — optional, off by
-  default, gated behind `-DNANITY_ENABLE_IDLE_LOOP` (needs
-  `nectar_diskmem.hpp` / `nectar_vision.hpp` / `nectar_splice.hpp`, all
-  present in this repo). The core chat/generation path never needs it.
-  The live KV window (StreamingLLM-style sink+shift, `ensure_cache_room()`
-  in `NEON-3.cpp` / `kv_cache_shift()` in `rawllm_forward.hpp`) is already
-  bounded and runs indefinitely on its own — a fixed `--ctx-len`/`kv_window`
-  never grows unbounded even with `--idle-max-tokens 0`.
-- **zRAM compression tier** (`nectar_zram.hpp`, opt-in via
-  `--idle-compression`/`--idle-chunk-tokens`, needs
-  `-DNANITY_ENABLE_IDLE_LOOP`) — as chunks age out of the live window, a
-  pluggable compressor can fold a summary of them permanently into the
-  pinned implant region instead of letting them vanish outright.
-  `--idle-compression=text` works today (the model summarizes its own
-  outgoing chunk, no training needed). `--idle-compression=slots` (reserved
-  KV-row compression, à la Gist Tokens/AutoCompressors/ICAE) has its core
-  cache primitive (`kv_cache_compact()` in `rawllm_forward.hpp`) but is not
-  wired into the idle loop yet — see that function's doc comment for what
-  training/masking work is still needed before it produces anything but
-  noise. (No standalone test harness for it ships on this branch.)
+## Files on this branch (beyond `main`)
 
-## Known limitations
+| File | What it is |
+|---|---|
+| `matvec_f32.comp` | F32 GEVM (matrix-vector) shader — required |
+| `matvec_f32_scalar.comp` | Scalar fallback variant of the F32 GEVM shader — required |
+| `matvec_q4_0.comp` | Q4_0 quantized GEVM shader (manual unpack; `-DHAS_INT8_DOT=1`/`-DINT8_STORAGE=1` variants build from this same source) — required |
+| `matvec_q8_0.comp` | Q8_0 quantized GEVM shader — required |
+| `matvec_f16.comp` | Experimental F16 GEVM shader — optional, only loaded if its `.spv` is present |
+| `matvec_f32_x2.comp` | Experimental 2-wide F32 GEVM shader — optional, only loaded if its `.spv` is present |
+| `test_vulkan_matvec.cpp` | Standalone correctness + throughput check for the F32 matvec path, independent of `NEON-3.cpp` |
+| `test_cpu_matvec.cpp` | CPU-side comparison: the real `simd::dot_f32()` dispatch, single-threaded and naive-threaded, same shape/seed as the Vulkan test so the numbers are comparable |
+| `test_cuda_matvec.cu` | `cublasSgemv()` comparison on the same hardware — isolates the API/driver-stack gap from the Vulkan number, no hardware confound |
+| `VULKAN_BACKEND_NOTES.md` | The full write-up: perf changes, real-hardware (NVIDIA T4) results, and the build recipe this README is based on |
 
-- **Vulkan backend** (`rawllm_vulkan.hpp`): experimental, F32-matvec-only,
-  gated behind `-DUSE_VULKAN`. Verified correct end-to-end (device init,
-  descriptor/pipeline setup, the `shaders/matvec_f32.comp` shader itself)
-  against a software Vulkan implementation (Mesa lavapipe) across a range of
-  matrix sizes including realistic transformer-layer dimensions — but **not
-  yet exercised on real GPU hardware**, and **not wired into the actual
-  generation hot path**: `--model ... --probe` with a Vulkan-enabled build
-  will initialize the backend and log whether a usable device was found,
-  but every token is still computed on the CPU path
-  (`rawllm_simd_dispatch.hpp`) regardless. Only F32 weights are covered;
-  quantized (Q4_0/Q8_0/K-quant) tensors would need a per-row dequant step
-  before this shader could touch them, which is real added cost the
-  CPU-side fused int8 kernels don't pay — deciding when that trade-off is
-  worth it, and actually routing `proj_all_positions()` through the GPU for
-  it, is the next piece of work here, not something this header claims to
-  do yet.
+`rawllm_vulkan.hpp` itself, `rawllm_rocm.hpp`, and the rest of the engine
+are unchanged from `main` — see that branch's README for what they do.
 
-**NCTR** Nctr is still not wired in. NCTRloader currently
-does not fully replace NEON's GGUFloader. However, it may be added in v0.3
-or later.
+## Prerequisites
 
-- Single-operator, no independent security audit yet (see `LICENSE`).
+- A Vulkan loader + headers (LunarG Vulkan SDK, or your distro's
+  `vulkan-headers`/`libvulkan-dev`) and a working Vulkan device — real
+  hardware or a software implementation like Mesa lavapipe for
+  logic-only testing.
+- `glslangValidator`, **built with `--target-env vulkan1.1` support** —
+  the subgroup-reduction ops in `matvec_f32.comp`/`matvec_f32_scalar.comp`/
+  `matvec_q4_0.comp`/`matvec_q8_0.comp` need SPIR-V 1.3, and the default
+  target (SPIR-V 1.0) fails with `'subgroup op' : requires SPIR-V 1.3`
+  without that flag.
+- Optional, for the comparison harness only: a CUDA toolchain (`nvcc`,
+  `cublas`) on NVIDIA hardware, to reproduce the cuBLAS numbers in
+  `VULKAN_BACKEND_NOTES.md` alongside the Vulkan ones.
 
-## Out of scope
+## Build: compiling the shaders
 
-Two different kinds of "not here": things this project will never be, and
-things that are just sequenced after other work. Mixing those together is
-how a focused runtime slowly turns into a second llama.cpp — writing the
-line down now is meant to stop that before it starts.
+**Shader directory note.** `VULKAN_BACKEND_NOTES.md`'s original recipe
+compiles straight to the repo root (the `.comp` sources sit there, not
+in a `shaders/` subfolder) and passes `"."` as the shaders directory.
+`test_vulkan_matvec.cpp` and `NEON-3.cpp`'s `--probe` path instead
+hardcode `"shaders"` as the constructor argument. Pick one and be
+consistent:
 
-**Permanently out of scope — not planned, not "later":**
-- **Continuous batching / paged attention** (vLLM-style block-table KV
-  cache, prefix sharing across concurrent requests). This isn't a kernel
-  you add, it's request scheduling and memory pooling — architecturally
-  most of what makes a multi-tenant serving engine a multi-tenant serving
-  engine. NEON is a single-user runtime (one companion, one conversation
-  at a time); taking this on would roughly double the codebase's
-  conceptual surface for a capability this project doesn't need.
-- **Serving many models, or many requests, on one GPU.** Same reasoning —
-  NEON is not trying to be an inference server.
-- **Mixture-of-Experts.** NANITY is a fixed, single dense architecture on
-  purpose (see the spec) — no per-architecture branching, and MoE routing
-  is exactly the kind of per-architecture special case this project
-  exists to avoid.
-- **GPU flash-attention** (finishing the composable_kernel `DeviceMHAFwd`
-  stub in `rawllm_rocm.hpp`). Pulling in CK as a real dependency and
-  validating a fused attention kernel against real hardware is its own
-  project, not an incremental addition to this one. An online-softmax
-  CPU-side attempt at part of this was tried and reverted after
-  benchmarking showed it regressed at long context (doubled `exp()` calls
-  per position outweighed the memory-traffic savings it was meant to
-  provide) — see the git history on `rawllm_forward.hpp`'s attention loop
-  if you want the specifics before trying this again.
-**Deferred, not ruled out — sequenced behind validating what's already
-here:**
-- **K-quant (Q4_K/Q5_K/Q6_K) fused int8 kernels.** Only Q4_0/Q8_0 get the
-  fast fused path today; K-quants fall through to full dequantize-to-F32.
-  Deliberately not adding this yet: Q4_0 itself hasn't been proven to
-  produce reliably coherent, instruction-following output end-to-end (see
-  Known limitations above — TinyLlama Q4_0 currently produces valid
-  English that doesn't follow the prompt, and it isn't confirmed whether
-  that's a quantization/model accuracy issue or a runtime bug). Adding
-  more quantization formats on top of an unproven one is how you end up
-  debugging two things at once instead of one. Once Q4_0/Q8_0 are
-  confirmed producing coherent, prompt-following output on a real
-  instruct model, K-quants are the natural next step — not before.
+- **Easiest:** compile into a `shaders/` subdirectory, matching what the
+  test harness and `NEON-3.cpp` already expect:
+  ```bash
+  mkdir -p shaders
+  glslangValidator -V --target-env vulkan1.1 matvec_f32.comp        -o shaders/matvec_f32.spv
+  glslangValidator -V --target-env vulkan1.1 matvec_f32_scalar.comp -o shaders/matvec_f32_scalar.spv
+  glslangValidator -V --target-env vulkan1.1 matvec_q4_0.comp       -o shaders/matvec_q4_0.spv
+  glslangValidator -V --target-env vulkan1.1 matvec_q8_0.comp       -o shaders/matvec_q8_0.spv
+  # Optional, experimental, only loaded if present:
+  glslangValidator -V --target-env vulkan1.1 matvec_f16.comp     -o shaders/matvec_f16.spv
+  glslangValidator -V --target-env vulkan1.1 matvec_f32_x2.comp  -o shaders/matvec_f32_x2.spv
+  ```
+- **Alternative:** if you'd rather match `VULKAN_BACKEND_NOTES.md`
+  exactly, compile straight to the repo root (drop `shaders/` from every
+  `-o` path above) and change the constructor argument in
+  `test_vulkan_matvec.cpp`/`NEON-3.cpp` from `"shaders"` to `"."`.
 
-## CPU SIMD backends
+## Build & run: the Vulkan test harness
 
-`rawllm_forward.hpp`'s dot-product / fused-quantized-dot kernels are split
-into their own headers so a specific ISA backend can be built, read, or
-benchmarked in isolation instead of hunting through the forward pass:
-
-- `rawllm_simd_scalar.hpp` — portable fallback, always available, and the
-  correctness reference every vectorized backend is checked against.
-- `rawllm_simd_avx2.hpp` — AVX2+FMA kernels (auto-selected whenever the
-  build already has `__AVX2__`, e.g. via `-mavx2 -mfma`).
-- `rawllm_simd_avx512.hpp` — AVX-512 kernels, with an `AVX512-VNNI` fast
-  path (`_mm256_dpbusd_epi32`, applied per 32-byte block) when the build
-  also has `-mavx512vnni` **and** `-mavx512vnni`'s prerequisite
-  `-mavx512vl` (VNNI's 256-bit instruction forms need VL to target
-  YMM registers — `-mavx512vnni` alone does not imply it, and previously
-  a `-mavx512vnni`-only build failed to compile entirely rather than
-  falling back; that's fixed, so that combination now degrades to the
-  plain AVX-512F path instead of failing the build). Opt-in via
-  `-DUSE_AVX512` (see below) — AVX-512 is never auto-selected, since a
-  build box having it doesn't guarantee every machine the binary runs on
-  does too.
-- `rawllm_simd_dispatch.hpp` — picks AVX-512 > AVX2 > scalar at compile
-  time and exposes the winner as `simd::dot_f32` / `simd::axpy_f32` /
-  `simd::dot_q4_0_q8_0` / `simd::dot_q8_0_q8_0`; this is the only one of
-  the four `rawllm_forward.hpp` actually includes.
-
-Build any translation unit that includes `rawllm_simd_dispatch.hpp` with
-`-DRAWLLM_SIMD_SELFTEST` to get `simd::run_selftest()`, which checks
-whichever backend got selected against the scalar reference over
-randomized Q4_0/Q8_0 blocks and plain dot/axpy inputs — a development/CI
-aid, not compiled in by default.
-
-## Build
-
-CPU-only (no GPU needed):
+```bash
+g++ -std=c++20 -O2 -pthread -DUSE_VULKAN test_vulkan_matvec.cpp -lvulkan -o test_vulkan_matvec
+./test_vulkan_matvec
 ```
-g++ -std=c++20 -O2 -pthread NEON-3.cpp -o neon
-```
-AVX2 (auto-detected from the compiler flag, no extra `-D` needed):
-```
-g++ -std=c++20 -O2 -pthread -mavx2 -mfma NEON-3.cpp -o neon
-```
-AVX-512 (opt-in; add `-mavx512bw -mavx512vnni -mavx512vl` for the widened
-int8 path — `-mavx512vl` is required alongside `-mavx512vnni`, see above):
-```
-g++ -std=c++20 -O2 -pthread -mavx512f -mavx512bw -mavx512vnni -mavx512vl -DUSE_AVX512 NEON-3.cpp -o neon
-```
-With the optional idle-loop features:
-```
-g++ -std=c++20 -O2 -pthread -DNANITY_ENABLE_IDLE_LOOP NEON-3.cpp -o neon
-```
-ROCm build (GPU dispatch — see the "ROCm GPU dispatch" note above; not
-required for CPU inference). Needs a HIP/ROCm toolchain (`hipcc`) and
-linking against `rocblas`/`amdhip64` — not compile-tested in this
-environment (no ROCm SDK available here), so the exact flags your ROCm
-install needs may differ from a generic example:
-```
-hipcc -std=c++20 -O2 -pthread -DUSE_ROCBLAS -DUSE_ROCM NEON-3.cpp -lrocblas -lamdhip64 -o neon
-```
+Exercises the F32 GEVM path end-to-end: constructs `VulkanMatvecBackend`,
+uploads a random 4096×4096 weight matrix, checks GPU output against a
+CPU double-precision reference (pass bar: max relative error < 1e-2,
+looser than bit-exact since GPU/CPU float accumulation order differs),
+then times 500 iterations after 20 warmup calls. Doesn't need a trained
+model or the rest of the engine — it drives the backend directly with
+synthetic data.
 
-Vulkan build (experimental — see `rawllm_vulkan.hpp` and
-[Known limitations](#known-limitations) above). The `.comp` shader
-sources, the compiled-`.spv` build recipe, and the standalone test
-harnesses for this backend all live on the **`VULKAN-EXPERIMENTAL`**
-branch, not here — `main` ships `rawllm_vulkan.hpp` itself (so `-DUSE_VULKAN`
-compiles) but no shader sources to build against it. Switch branches for
-the Vulkan-specific guide:
+## Build & run: the comparison harnesses
+
+For putting the Vulkan numbers in context against CPU and (on NVIDIA
+hardware) cuBLAS, using the same shape/seed/iteration counts so the
+`us/call` outputs line up:
+
+```bash
+g++ -std=c++20 -O2 -pthread test_cpu_matvec.cpp -o test_cpu_matvec
+./test_cpu_matvec
 ```
-git checkout VULKAN-EXPERIMENTAL
+Times `simd::dot_f32()` — the actual AVX2/AVX-512 dispatch
+`proj_all_positions()` uses in the real engine — single-threaded and via
+a naive `std::thread` row-split. GCC/Clang function multiversioning means
+a plain `-O2` build already picks the fastest ISA variant for the host
+CPU; no `-mavx2`/`-mavx512...` flags needed for this one.
+
+```bash
+nvcc -O2 -std=c++17 test_cuda_matvec.cu -lcublas -o test_cuda_matvec
+./test_cuda_matvec
 ```
-On `main`, `NEON-3.cpp -DUSE_VULKAN --probe` will compile and run, but
-`VulkanMatvecBackend` construction is wrapped in a try/catch — with no
-`.spv` files to find, it prints `[Hardware] Vulkan: unavailable (...)` and
-falls back to CPU rather than failing the build:
-```
+NVIDIA-only, needs the CUDA toolkit (`nvcc` is usually already on `PATH`
+in a Colab/cloud GPU runtime; otherwise typically at
+`/usr/local/cuda/bin/nvcc`). Matches `test_vulkan_matvec.cpp`'s "one
+blocking round trip per call" discipline deliberately, so the two
+`us/call` numbers are directly comparable — this is not how you'd use
+cuBLAS for best throughput in a real pipeline.
+
+## Building the full runtime with Vulkan enabled
+
+Once the shaders above are compiled and in place:
+```bash
 g++ -std=c++20 -O2 -pthread -DUSE_VULKAN NEON-3.cpp -lvulkan -o neon
-```
-
-## Testing
-
-`test_nctr_loader.cpp` is a standalone smoke test for the `.nctr` loader
-(`rawllm_nctr_loader.hpp`) — it takes a `.nctr` file to load and validate:
-```
-g++ -std=c++20 -O0 -g -pthread test_nctr_loader.cpp -o test_nctr_loader
-./test_nctr_loader path/to/model.nctr
-```
-
-## Quick start
-
-```
-# 1. Check compatibility before converting anything
-python3 nanity_convert.py --detect-only your-model.gguf
-
-# 2. Convert (if the report is clean, or you've reviewed what --drop-*-anyway loses)
-python3 nanity_convert.py your-model.gguf your-model-nanity.gguf --quant Q4_0
-
-# 3. Sanity check: loads and passes spec validation, no generation
 ./neon --model your-model-nanity.gguf --probe
-
-# 4. Generate
-./neon --model your-model-nanity.gguf --prompt "Explain photosynthesis in one sentence."
 ```
+`--probe` constructs `VulkanMatvecBackend` and reports whether a usable
+device + shader set was found (`[Hardware] Vulkan: ...`), but this is
+informational only — every token is still generated on the CPU path
+regardless of what `--probe` reports. Nothing here routes real
+generation through the GPU yet; see `rawllm_vulkan.hpp`'s header comment
+and `VULKAN_BACKEND_NOTES.md`'s "What's not done yet" for the actual
+state of GPU-routed inference.
 
-`--interactive` runs a persistent stdin/stdout loop (model stays loaded
-between prompts, accepts JSON `{"messages": [...]}` for chat-template
-formatting and per-request sampling params). `NANITY_DEBUG_LOGITS=1`
-dumps the top-10 first-token candidates before sampling — useful for
-diagnosing a bad conversion vs. a runtime bug.
+## What's validated vs. not (see `VULKAN_BACKEND_NOTES.md` for the full detail)
 
-## Training your own NANITY model
+- **Real-hardware result on record:** NVIDIA T4, F32 4096×4096 matvec.
+  The optimized backend (persistent block-level memory mapping +
+  descriptor-set-write deduplication) came in **about 5–11% slower than
+  cuBLAS's SGEMV** on the same hardware — a clean isolation of the
+  API/driver-stack gap specifically, with hardware held constant.
+- **Not tested on any hardware yet:** AMD/RDNA/CDNA/MI300X (the
+  project's actual target — the T4 result used the only GPU available
+  at the time) and the Q4_0/Q8_0 quantized GEVM path.
 
-`train_nanity_fixed.py` trains `modeling_nanity.py` (the reference
-PyTorch implementation of the spec) and exports via `export_gguf()` /
-`export_nctr()`. `prepare_data.py` and `modeling_nanity.py` are currently
-set up for the first model, **Nectar 8** (not yet trained — training
-hasn't started). Anyone can reuse the same data pipeline and architecture
-to train their own model against the same spec.
+## Back to `main`
 
-This isn't a book you need to read cover to cover — the tutorial content
-in this repo is meant to be worked through hands-on, not studied first.
-
-## Repository layout
-
-This is every file on the `main` branch, grouped by what it's for. (The
-Vulkan `.comp` shader sources and their standalone test harnesses live on
-the `VULKAN-EXPERIMENTAL` branch — see [Build](#build) above.)
-
-**Core runtime**
-
-| File | What it is |
-|---|---|
-| `NEON-3.cpp` | The runtime itself — CLI, generation loop, tokenizer, model-format dispatch |
-| `rawllm_loader.hpp` | GGUF loader |
-| `rawllm_nctr_loader.hpp` | `.nctr` loader (parsing works; not yet wired into inference) |
-| `rawllm_forward.hpp` | Transformer forward pass — attention, RoPE, GQA, SwiGLU, KV cache (incl. `kv_cache_compact()`, the zRAM-tier primitive) |
-| `rawllm_common.hpp` | Shared types/helpers used across loaders and the forward pass |
-| `rawllm_util.hpp` | Small standalone utilities (no dependencies on the rest of the engine) |
-| `rawllm_json.hpp` | Minimal JSON parsing/writing used for `--interactive`'s request/response format |
-
-**CPU SIMD backends** (see "CPU SIMD backends" above for how these fit together)
-
-| File | What it is |
-|---|---|
-| `rawllm_simd_scalar.hpp` | Portable fallback + correctness reference for every vectorized backend |
-| `rawllm_simd_avx2.hpp` | AVX2+FMA dot-product / fused-quantized-dot kernels |
-| `rawllm_simd_avx512.hpp` | AVX-512 kernels, with an AVX-512-VNNI fast path |
-| `rawllm_simd_dispatch.hpp` | Picks AVX-512 > AVX2 > scalar at compile time; the only one of the four `rawllm_forward.hpp` includes |
-
-**GPU backends (optional)**
-
-| File | What it is |
-|---|---|
-| `rawllm_rocm.hpp` | ROCm/HIP backend (AMD MI300X target) |
-| `rawllm_vulkan.hpp` | Vulkan compute backend (experimental, F32/Q4_0/Q8_0 matvec + F32/F16 matmul). Compiles here under `-DUSE_VULKAN`; the shader sources and build/test workflow are on `VULKAN-EXPERIMENTAL` |
-
-**Idle-loop / companion-overlay (optional feature, `-DNANITY_ENABLE_IDLE_LOOP`)**
-
-| File | What it is |
-|---|---|
-| `nectar_diskmem.hpp` | Disk-backed context eviction |
-| `nectar_vision.hpp` | Hyprland vision hooks |
-| `nectar_splice.hpp` | Idle-loop generation splicing |
-| `nectar_zram.hpp` | zRAM compression tier — chunk-pointer ring buffer + pluggable compression backend |
-
-**Training & conversion pipeline**
-
-| File | What it is |
-|---|---|
-| `nanity_convert.py` | Converts third-party GGUF models into NANITY-conformant GGUF (`--detect-only` to check compatibility first) |
-| `nanity_data_format.py` | `.nctr` container format definitions |
-| `train_nanity_fixed.py` | Training pipeline + `export_gguf()` / `export_nctr()` |
-| `modeling_nanity.py` | Reference PyTorch implementation of the NANITY architecture |
-| `prepare_data.py` | Training data preparation |
-
-**Tests**
-
-| File | What it is |
-|---|---|
-| `test_nctr_loader.cpp` | Standalone smoke test for the `.nctr` loader — takes a `.nctr` file to load and validate (see "Testing" above) |
-
-**Docs & project meta**
-
-| File | What it is |
-|---|---|
-| `NANITY_ARCHITECTURE_SPEC.md` | The spec itself — read this for the full technical contract |
-| `VULKAN_BACKEND_NOTES.md` | Vulkan backend perf-work log and first real-hardware (NVIDIA T4) validation notes. Written against the `VULKAN-EXPERIMENTAL` branch's file layout — see that branch's README for the current build/test guide |
-| `CONTRIBUTING.md` | How to contribute — read before sending a PR, especially the backend-review notes |
-| `SECURITY.md` | Vulnerability reporting policy (solo-maintained, best-effort, no SLA) |
-| `LICENSE` | Source-available license — current terms during the prototyping phase |
-| `nanity.html` | Project website |
-
-## License
-
-Source-available, - see [`LICENSE`](./LICENSE) for exactly what's currently permitted
-(download, local compile, testing, bug reports).
+```bash
+git checkout main
+```
+for the general runtime README — build flags, CPU SIMD backends,
+training pipeline, quick start, and the full repository layout.
