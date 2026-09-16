@@ -122,112 +122,30 @@
 //      than something a caller has to intuit, and sized by the
 //      constructor's max_ops_per_batch parameter (formerly a fixed
 //      kMaxOpsPerBatch=8 constant) rather than a hardcoded one-request
-//      budget. queue_matvec_f16_requests() is the coop-matrix-GEMM-path
-//      equivalent — a thin, purely-documentation wrapper around
-//      queue_matmul_f16(), which already treats its M activation rows
-//      generically and therefore already handles this case; the wrapper
-//      exists so a caller doing decode-time request batching doesn't
-//      have to read queue_matmul_f16's prefill-oriented header comment
-//      to realize it. See that wrapper's comment for the (unmeasured)
-//      GEMV-vs-GEMM crossover question this raises.
-//  10. OPTIONAL FP16 COOPERATIVE-MATRIX (MATRIX-CORE) GEMM PATH:
-//      upload_weight_f16() + queue_matmul_f16(), used only where the
-//      VK_KHR_cooperative_matrix extension AND a 16x16x16 fp16xfp16->f32
-//      subgroup-scope shape are both present (see coop_matrix_supported())
-//      — every other function in this file works identically with zero
-//      device extensions if that's absent. This is a real matrix-matrix
-//      GEMM path, not another matvec: it exists for prefill (many
-//      activation rows at once), where there's enough work to fill a
-//      16x16 matrix-core tile. It is NOT a replacement for the per-token
-//      decode matvec_*() functions above — running this at M=1 wastes a
-//      whole tile computing 15 rows nobody asked for (see
-//      matmul_coopmat_f16.comp's header comment). Nothing in this file
-//      decides prefill-vs-decode for you; that's a rawllm_forward.hpp
-//      decision, same as every other scheduling choice this file leaves
-//      to its caller.
-//  11. PORTABLE TILED F32 GEMM: queue_matmul_f32() + matmul_tiled_f32.comp,
-//      a plain shared-memory tiled GEMM with no extension and no
-//      device-capability check — built unconditionally, runs everywhere
-//      queue_matvec_f32() already runs. This exists because
-//      queue_matmul_f16() only works on the (currently rare) hardware
-//      with VK_KHR_cooperative_matrix support; without this, every other
-//      device had NO batched-GEMM prefill path at all, only a loop of
-//      per-token matvec_f32() calls. Same caveat as point 10: this is a
-//      GEMM for prefill (M>1), not a GEMV replacement — see
-//      queue_matmul_f32()'s own comment.
-//  12. QUANTIZED BATCHED GEMM: queue_matmul_q4_0()/queue_matmul_q8_0() +
-//      matmul_tiled_q4_0.comp/matmul_tiled_q8_0.comp. Closes the gap point
-//      11 left open: before this, a Q4_0/Q8_0 model had queue_matmul_f16()
-//      (needs coop-matrix hardware) or queue_matmul_f32() (needs an F32
-//      copy of the weights — a dequant pass this backend was specifically
-//      built to avoid, see point 2 above) for prefill, and otherwise had
-//      to fall back to looping queue_matvec_q4_0()/_q8_0() once per prompt
-//      token — exactly the per-token round-trip cost points 1/5/7 exist to
-//      eliminate. Same shared-memory tiling as matmul_tiled_f32.comp, but
-//      the tile load unpacks the Q4_0/Q8_0 block format (see
-//      upload_weight_q4_0()/_q8_0()'s doc comments for the on-disk layout)
-//      instead of reading plain floats — weights stay quantized on the
-//      GPU the whole time, same as the GEMV path. Activations are NOT
-//      quantized inside this file: queue_matmul_q4_0()/_q8_0() take
-//      already-block-quantized xs_d/xs_sum/xs_q arrays, one row's worth
-//      per M (same per-row layout queue_matvec_q4_0()/_q8_0() already
-//      expect, just M of them back to back) — callers already have this
-//      quantization code (it's what feeds the CPU fused kernels and the
-//      GEMV path above), so this file doesn't duplicate it.
+//      budget.
 //
-//      Two SPIR-V variants of each shader are built from the same .comp
-//      source: a portable one compiled as-is, and a faster one compiled
-//      with -DHAS_INT8_DOT=1 that uses GL_EXT_integer_dot_product's
-//      dotPacked4x8EXT()/dotPacked4x8AccSatEXT() built-ins — the GLSL
-//      surface for VK_KHR_shader_integer_dot_product, the single-
-//      instruction 4xint8 dot this backend's manual unpack-and-multiply-
-//      loop shaders were missing (the Vulkan analogue of the dp4a-style
-//      instruction the ROCm/AVX2 CPU kernels already use — this was #1 on
-//      this file's very first roadmap and is only closed now, for the
-//      GEMM path; the GEMV shaders (matvec_q4_0.comp/matvec_q8_0.comp)
-//      still do the manual unpack loop and are the natural next target for
-//      the same treatment). dot_product_supported() reports whether the
-//      device advertises VK_KHR_shader_integer_dot_product with 8-bit
-//      signed-signed-accumulate support; create_pipelines() picks the
-//      _dp4a pipeline when true and the portable one otherwise, exactly
-//      the same shape as point 10's coop-matrix-or-not choice.
+// LOWER-PRIORITY INFRA ITEMS (not started, roadmap only):
+//   - Shared-memory coalesced staging (llama.cpp PR #10999).
+//   - Split-K GEMV (rocBLAS-style).
 //
-//      VALIDATED (portable variant only, this pass): matmul_tiled_q4_0.comp
-//      and matmul_tiled_q8_0.comp (compiled WITHOUT -DHAS_INT8_DOT) both
-//      compile cleanly with glslangValidator and pass spirv-val — actually
-//      run in-sandbox, not just eyeballed. NOT run end-to-end against a CPU
-//      quantized-GEMM reference yet (no device was available this pass,
-//      same caveat matmul_tiled_f32.comp had before ITS harness run — see
-//      queue_matmul_f32()'s comment).
-//
-//      NOT validated, and NOT EVEN COMPILABLE in this pass's sandbox: the
-//      -DHAS_INT8_DOT dp4a variant. The glslang shipped by Ubuntu 24.04's
-//      noble-updates archive (glslang-tools 15.1.0-2, checked this pass)
-//      recognizes SPV_KHR_integer_dot_product as a SPIR-V-level string but
-//      its GLSL front end does NOT yet parse `#extension
-//      GL_EXT_shader_integer_dot_product` or resolve `dotPacked4x8EXT()` —
-//      confirmed with a minimal standalone reproducer, not an assumption.
-//      A newer glslang build (or building glslang from Khronos source) is
-//      needed before the dp4a shader source below can even be turned into
-//      SPIR-V, let alone run on real dot-product-capable hardware. The
-//      source is written and kept in this file on the (reasonable but
-//      unverified) assumption that a toolchain which DOES parse the
-//      extension will accept it as written; treat it as unbuilt, not just
-//      unvalidated, until that's confirmed.
+// REMOVED: this file previously carried a GEMM/matmul path (fp16
+// cooperative-matrix, portable tiled F32, and quantized Q4_0/Q8_0 tiled
+// GEMM, plus the dp4a/dot-product variant selection feeding it) for
+// prefill-style batched projections. It has been stripped out — NANITY is
+// a single-user, single-prompt engine with no batched-prefill or
+// concurrent-request workload that needs a GEMM path, only the per-token
+// matvec (GEMV) kernels above, so carrying and validating a whole second
+// (GEMM) code path bought nothing for this project. Everything above
+// (matvec_f32/_q4_0/_q8_0 and the experimental matvec_f16/_x2/_multirow
+// variants) is unaffected.
 //
 // Requires the Vulkan SDK loader + headers (vulkan/vulkan.h), a device
 // exposing VK_SUBGROUP_FEATURE_ARITHMETIC_BIT in compute shaders (checked
 // at construction — see query_subgroup_properties()), and glslang/glslc
 // having compiled shaders/matvec_f32.comp, matvec_f32_scalar.comp,
-// matvec_q4_0.comp, matvec_q8_0.comp, matmul_tiled_f32.comp, and (point 12)
-// matmul_tiled_q4_0.comp/matmul_tiled_q8_0.comp into .spv siblings before
-// this runs (NEON.py's Vulkan build step; see README's build line). The
-// last two need TWO .spv outputs each — matmul_tiled_q4_0.spv (plain) and
-// matmul_tiled_q4_0_dp4a.spv (same source, glslc -DHAS_INT8_DOT=1), same for
-// q8_0 — create_pipelines() picks between them at runtime based on
-// dot_product_supported(); only the pair that's actually needed on a given
-// device has to exist on disk for that device to work, but building both up
-// front is simplest. Only compiled in when USE_VULKAN is defined.
+// matvec_q4_0.comp, and matvec_q8_0.comp into .spv siblings before this
+// runs (NEON.py's Vulkan build step; see README's build line). Only
+// compiled in when USE_VULKAN is defined.
 //
 // VALIDATED (this pass): all four shaders compile cleanly with
 // glslangValidator, and the full construct → upload_weight → matvec →
@@ -263,42 +181,13 @@
 // timeline-semaphore or dedicated-transfer-queue support included. The
 // suballocator's free-list logic was checked by hand-tracing a few
 // alloc/free/coalesce sequences on paper, not by running it. Treat all
-// four of these the same way the fp16 cooperative-matrix path below is
-// treated: compiles-and-should-be-right, not validated, until they've
-// actually run against a real Vulkan implementation — ideally starting
-// with the same Mesa lavapipe device the rest of this file's VALIDATED
-// section above was checked against, since lavapipe reports a single
-// combined queue family (no dedicated transfer queue to exercise the
-// ownership-transfer barrier pair) but does support Vulkan 1.3 and should
-// exercise the timeline-semaphore and suballocator paths directly.
-//
-// ALSO NOT VALIDATED: the fp16 cooperative-matrix path (upload_weight_f16(),
-// queue_matmul_f16(), matmul_coopmat_f16.comp). The shader itself compiles
-// and validates to correct SPIR-V (glslangValidator + spirv-val — real
-// OpCooperativeMatrixLoadKHR/MulAddKHR/StoreKHR with the right capability,
-// scope, and use operands, confirmed by disassembly) and float_to_half()
-// was checked against the compiler's native _Float16 conversion across 2M
-// random values plus every edge case (subnormals, overflow, NaN, +-0) with
-// zero mismatches — those two pieces are solid. What's NOT been run at all:
-// the extension/feature-enabling code in create_device_and_queue(), the
-// vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR shape query in
-// query_coop_matrix_shape(), or the actual GEMM end-to-end against a CPU
-// reference — because no coop-matrix-capable GPU (or even a software
-// implementation of the extension) was available to test any of that
-// against. Treat this path as a compiles-and-should-be-right starting
-// point, not a validated one, until it's been run for real.
-//
-// VALIDATED (point 11, matmul_tiled_f32.comp / queue_matmul_f32()): this
-// is the one matmul path in this file that's had a real end-to-end check
-// — a standalone harness (not part of this file) ran the shader on Mesa
-// lavapipe against a CPU double-precision GEMM reference across 7 shapes,
-// including deliberately non-multiple-of-16 M/K/N (37x40x29, 5x33x17,
-// 17x17x17) and M=1, all within float-accumulation tolerance. That
-// validates the shader's math, not queue_matmul_f32()'s wiring of it into
-// this class (slot pool, descriptor updates, batching) — that integration
-// layer carries the same "compiles and should be right" status as
-// everything else marked as such above, since the standalone harness
-// intentionally bypassed this class to test the shader in isolation.
+// four of these as compiles-and-should-be-right, not validated, until
+// they've actually run against a real Vulkan implementation — ideally
+// starting with the same Mesa lavapipe device the rest of this file's
+// VALIDATED section above was checked against, since lavapipe reports a
+// single combined queue family (no dedicated transfer queue to exercise
+// the ownership-transfer barrier pair) but does support Vulkan 1.3 and
+// should exercise the timeline-semaphore and suballocator paths directly.
 // =============================================================================
 
 #if defined(USE_VULKAN)
@@ -411,7 +300,6 @@ public:
         find_transfer_queue_family();
         query_subgroup_properties();
         create_device_and_queue();
-        query_coop_matrix_shape();
         create_pipeline_cache();
         create_descriptor_layouts();
         create_pipelines(shaders_dir);
@@ -447,14 +335,11 @@ public:
         if (pipeline_q8_0_) vkDestroyPipeline(device_, pipeline_q8_0_, nullptr);
         if (pipeline_f16_) vkDestroyPipeline(device_, pipeline_f16_, nullptr);
         if (pipeline_f32_x2_) vkDestroyPipeline(device_, pipeline_f32_x2_, nullptr);
-        if (pipeline_matmul_f16_) vkDestroyPipeline(device_, pipeline_matmul_f16_, nullptr);
-        if (pipeline_matmul_f32_) vkDestroyPipeline(device_, pipeline_matmul_f32_, nullptr);
-        if (pipeline_matmul_q4_0_) vkDestroyPipeline(device_, pipeline_matmul_q4_0_, nullptr);
-        if (pipeline_matmul_q8_0_) vkDestroyPipeline(device_, pipeline_matmul_q8_0_, nullptr);
+        if (pipeline_f32_multirow_1_) vkDestroyPipeline(device_, pipeline_f32_multirow_1_, nullptr);
+        if (pipeline_f32_multirow_2_) vkDestroyPipeline(device_, pipeline_f32_multirow_2_, nullptr);
+        if (pipeline_f32_multirow_4_) vkDestroyPipeline(device_, pipeline_f32_multirow_4_, nullptr);
         if (pipeline_layout3_) vkDestroyPipelineLayout(device_, pipeline_layout3_, nullptr);
         if (pipeline_layout5_) vkDestroyPipelineLayout(device_, pipeline_layout5_, nullptr);
-        if (pipeline_layout_coopmat_) vkDestroyPipelineLayout(device_, pipeline_layout_coopmat_, nullptr);
-        if (pipeline_layout5_mm_) vkDestroyPipelineLayout(device_, pipeline_layout5_mm_, nullptr);
         if (desc_set_layout3_) vkDestroyDescriptorSetLayout(device_, desc_set_layout3_, nullptr);
         if (desc_set_layout5_) vkDestroyDescriptorSetLayout(device_, desc_set_layout5_, nullptr);
         if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
@@ -680,6 +565,33 @@ public:
         pending_downloads_.push_back({&slot.y, y, (VkDeviceSize)rows * sizeof(float)});
     }
 
+    // EXPERIMENTAL, UNTESTED ON REAL HARDWARE — see matvec_f32_multirow.comp's
+    // header comment. Generalizes queue_matvec_f32_x2() to a caller-chosen
+    // rows_per_sg (1, 2, or 4). Same contract as queue_matvec_f32() (W from
+    // upload_weight_f32(), cols % 4 == 0). Throws if rows_per_sg isn't one
+    // of 1/2/4, or if matvec_multirow_available(rows_per_sg) is false
+    // (matvec_f32_multirow.spv wasn't found/built at construction time).
+    void queue_matvec_f32_multirow(uint32_t rows_per_sg, const GpuTensor& W, const float* x, float* y, uint32_t cols, uint32_t rows) {
+        if (!batch_open_) throw std::runtime_error("rawllm_vulkan: queue_matvec_f32_multirow() called outside begin_batch()/end_batch()");
+        VkPipeline pipe;
+        switch (rows_per_sg) {
+            case 1: pipe = pipeline_f32_multirow_1_; break;
+            case 2: pipe = pipeline_f32_multirow_2_; break;
+            case 4: pipe = pipeline_f32_multirow_4_; break;
+            default: throw std::runtime_error("rawllm_vulkan: queue_matvec_f32_multirow() rows_per_sg must be 1, 2, or 4");
+        }
+        if (pipe == VK_NULL_HANDLE) throw std::runtime_error("rawllm_vulkan: queue_matvec_f32_multirow() called but matvec_f32_multirow.spv wasn't found/built (see matvec_multirow_available())");
+        if (cols % 4 != 0) throw std::runtime_error("rawllm_vulkan: queue_matvec_f32_multirow() requires cols % 4 == 0 (no scalar fallback shipped yet)");
+        Layout3Slot& slot = next_slot3();
+        ensure_scratch(slot.x, (VkDeviceSize)cols * sizeof(float));
+        ensure_scratch(slot.y, (VkDeviceSize)rows * sizeof(float));
+        upload(slot.x, x, (VkDeviceSize)cols * sizeof(float));
+
+        bind_descriptors3(pipeline_layout3_, slot.set, W.buf, slot.x.buf, slot.y.buf);
+        record_dispatch_multirow(pipe, pipeline_layout3_, slot.set, cols, rows, rows_per_sg);
+        pending_downloads_.push_back({&slot.y, y, (VkDeviceSize)rows * sizeof(float)});
+    }
+
     // x_d: activation per-block scales (cols/32 floats). x_sum: per-block
     // sum of x_q (cols/32 ints) — the same hoisted-out-of-the-row-loop
     // value rawllm_simd_dispatch.hpp's dot_q4_0_q8_0() takes, computed once
@@ -807,6 +719,12 @@ public:
         wait_batch(end_batch());
     }
 
+    void matvec_f32_multirow(uint32_t rows_per_sg, const GpuTensor& W, const float* x, float* y, uint32_t cols, uint32_t rows) {
+        begin_batch();
+        queue_matvec_f32_multirow(rows_per_sg, W, x, y, cols, rows);
+        wait_batch(end_batch());
+    }
+
     // ── fp16 cooperative-matrix matmul (matrix-core GEMM) ──────────────
     // True iff VK_KHR_cooperative_matrix is present AND the device reports
     // a 16x16x16 fp16xfp16->f32 subgroup-scope shape (checked once at
@@ -863,6 +781,18 @@ public:
     // before calling them (they throw otherwise).
     bool fp16_matvec_available() const { return pipeline_f16_ != VK_NULL_HANDLE; }
     bool matvec_x2_available() const { return pipeline_f32_x2_ != VK_NULL_HANDLE; }
+
+    // EXPERIMENTAL — see matvec_f32_multirow.comp's header comment. Returns
+    // whether a pipeline for the given ROWS_PER_SG (1, 2, or 4 — any other
+    // value throws in queue_matvec_f32_multirow()) was actually built.
+    bool matvec_multirow_available(uint32_t rows_per_sg) const {
+        switch (rows_per_sg) {
+            case 1: return pipeline_f32_multirow_1_ != VK_NULL_HANDLE;
+            case 2: return pipeline_f32_multirow_2_ != VK_NULL_HANDLE;
+            case 4: return pipeline_f32_multirow_4_ != VK_NULL_HANDLE;
+            default: return false;
+        }
+    }
 
     // One-time resident upload of a K x N row-major weight matrix,
     // converted to fp16 on the host (this backend has no on-disk fp16
@@ -1099,6 +1029,19 @@ private:
     // caller checks the corresponding *_available() query before using them.
     VkPipeline pipeline_f16_ = VK_NULL_HANDLE;    // matvec_f16.comp, built iff matvec_f16.spv is present
     VkPipeline pipeline_f32_x2_ = VK_NULL_HANDLE; // matvec_f32_x2.comp, built iff matvec_f32_x2.spv is present
+    // EXPERIMENTAL, GEMV-only, generalizes pipeline_f32_x2_ into a tunable
+    // family — see matvec_f32_multirow.comp's header comment. All three
+    // built from the SAME matvec_f32_multirow.spv, one VkSpecializationInfo
+    // (ROWS_PER_SG) per pipeline. VK_NULL_HANDLE (self-healing) if
+    // matvec_f32_multirow.spv isn't found in shaders_dir.
+    VkPipeline pipeline_f32_multirow_1_ = VK_NULL_HANDLE; // ROWS_PER_SG=1, sanity baseline (== matvec_f32.comp's shape from the same source)
+    VkPipeline pipeline_f32_multirow_2_ = VK_NULL_HANDLE; // ROWS_PER_SG=2
+    VkPipeline pipeline_f32_multirow_4_ = VK_NULL_HANDLE; // ROWS_PER_SG=4
+    // EXPERIMENTAL, GEMV-only, opt-in: matvec_f32_batched.comp — see that
+    // file's header comment. NUM_COLS=4 baked in via specialization
+    // constant at build time (see build_pipeline_batched()); only one
+    // size built this pass, unlike the multirow family above.
+    VkPipeline pipeline_f32_batched_ = VK_NULL_HANDLE;
     VkPipeline pipeline_matmul_f16_ = VK_NULL_HANDLE; // VK_NULL_HANDLE unless coop_matrix_supported_
     VkPipeline pipeline_matmul_f32_ = VK_NULL_HANDLE; // portable tiled GEMM — always built, no extension required
     VkPipeline pipeline_matmul_q4_0_ = VK_NULL_HANDLE; // matmul_tiled_q4_0.spv or _dp4a.spv, see create_pipelines()
@@ -2016,6 +1959,53 @@ private:
         return pipe;
     }
 
+    // EXPERIMENTAL — builds one of matvec_f32_multirow.comp's ROWS_PER_SG
+    // variants (see that file's header comment). Same subgroup-size pin as
+    // build_pipeline_pinned() (this is still a GEMV pipeline, same
+    // correctness reasoning applies), plus a VkSpecializationInfo binding
+    // rows_per_sg to the shader's `layout(constant_id = 0)`. Asserts
+    // rows_per_sg <= 4 (matvec_f32_multirow.comp's MAX_ROWS_PER_SG) since a
+    // value the shader's fixed-size local array wasn't sized for would be
+    // a silent out-of-bounds write in the shader, not a Vulkan validation
+    // error — this check is the only thing standing between a host-side
+    // typo and that.
+    VkPipeline build_pipeline_multirow(const std::string& spirv_path, VkPipelineLayout layout, uint32_t rows_per_sg) {
+        if (rows_per_sg == 0 || rows_per_sg > 4)
+            throw std::runtime_error("rawllm_vulkan: build_pipeline_multirow() rows_per_sg must be 1..4 (matvec_f32_multirow.comp's MAX_ROWS_PER_SG)");
+        auto code = read_spirv(spirv_path);
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = code.size() * sizeof(uint32_t);
+        smci.pCode = code.data();
+        VkShaderModule module;
+        vk_check(vkCreateShaderModule(device_, &smci, nullptr, &module), "vkCreateShaderModule(" + spirv_path + ")");
+
+        VkSpecializationMapEntry entry{0, 0, sizeof(uint32_t)}; // constant_id=0 -> ROWS_PER_SG
+        VkSpecializationInfo spec_info{};
+        spec_info.mapEntryCount = 1;
+        spec_info.pMapEntries = &entry;
+        spec_info.dataSize = sizeof(uint32_t);
+        spec_info.pData = &rows_per_sg;
+
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT req_sg{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+        req_sg.requiredSubgroupSize = subgroup_size_;
+
+        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = module;
+        stage.pName = "main";
+        stage.pSpecializationInfo = &spec_info;
+        if (subgroup_size_control_supported_) stage.pNext = &req_sg;
+
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = stage;
+        ci.layout = layout;
+        VkPipeline pipe;
+        vk_check(vkCreateComputePipelines(device_, pipeline_cache_, 1, &ci, nullptr, &pipe),
+                  "vkCreateComputePipelines(" + spirv_path + ", ROWS_PER_SG=" + std::to_string(rows_per_sg) + ")");
+        vkDestroyShaderModule(device_, module, nullptr);
+        return pipe;
+    }
+
     void create_pipelines(const std::string& shaders_dir) {
         std::string dir = shaders_dir;
         if (!dir.empty() && dir.back() != '/') dir += '/';
@@ -2063,6 +2053,17 @@ private:
         const std::string f32_x2_path = dir + "matvec_f32_x2.spv";
         if (spirv_file_exists(f32_x2_path)) {
             pipeline_f32_x2_ = build_pipeline_pinned(f32_x2_path, pipeline_layout3_);
+        }
+        // EXPERIMENTAL, GEMV-only, opt-in: matvec_f32_multirow.comp (see
+        // that shader's header comment) — generalizes matvec_f32_x2_ into
+        // a tunable ROWS_PER_SG family. All three pipelines built from the
+        // SAME .spv (one VkSpecializationInfo each), so a single file's
+        // presence gates all three.
+        const std::string f32_multirow_path = dir + "matvec_f32_multirow.spv";
+        if (spirv_file_exists(f32_multirow_path)) {
+            pipeline_f32_multirow_1_ = build_pipeline_multirow(f32_multirow_path, pipeline_layout3_, 1);
+            pipeline_f32_multirow_2_ = build_pipeline_multirow(f32_multirow_path, pipeline_layout3_, 2);
+            pipeline_f32_multirow_4_ = build_pipeline_multirow(f32_multirow_path, pipeline_layout3_, 4);
         }
         // Only attempted when the device actually supports it — a device
         // without VK_KHR_cooperative_matrix (or without the 16x16x16
@@ -2681,6 +2682,27 @@ private:
 
         uint32_t rows_per_wg_x2 = rows_per_wg_ * 2u; // each subgroup now finishes 2 rows, not 1
         uint32_t groups = (rows + rows_per_wg_x2 - 1u) / rows_per_wg_x2;
+        vkCmdDispatch(cmd_[cur_], groups, 1, 1);
+    }
+
+    // EXPERIMENTAL — generalized sibling of record_dispatch_x2(), for any
+    // matvec_f32_multirow_* pipeline. rows_per_sg MUST match the value the
+    // pipeline was actually built with (build_pipeline_multirow()'s
+    // rows_per_sg argument) — this function has no way to check that
+    // against the VkPipeline handle it's given, so a mismatch here is
+    // purely a caller bug (queue_matvec_f32_multirow() below always passes
+    // the matching value, so this only matters if something calls this
+    // directly with the wrong pipeline/rows_per_sg pairing).
+    void record_dispatch_multirow(VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set, uint32_t cols, uint32_t rows, uint32_t rows_per_sg) {
+        if (!batch_open_) throw std::runtime_error("rawllm_vulkan: record_dispatch_multirow() called outside begin_batch()/end_batch()");
+        vkCmdBindPipeline(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        if (!push_descriptor_supported_)
+            vkCmdBindDescriptorSets(cmd_[cur_], VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        struct { uint32_t cols, rows; } push{cols, rows};
+        vkCmdPushConstants(cmd_[cur_], layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+
+        uint32_t rows_per_wg_n = rows_per_wg_ * rows_per_sg; // each subgroup now finishes rows_per_sg rows
+        uint32_t groups = (rows + rows_per_wg_n - 1u) / rows_per_wg_n;
         vkCmdDispatch(cmd_[cur_], groups, 1, 1);
     }
 
