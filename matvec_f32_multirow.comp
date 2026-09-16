@@ -1,0 +1,137 @@
+#version 450
+// =============================================================================
+// matvec_f32_multirow.comp — EXPERIMENTAL, UNTESTED ON HARDWARE.
+// Generalizes matvec_f32_x2.comp to a build-time-selectable ROWS_PER_SG
+// (1, 2, or 4): each subgroup finishes ROWS_PER_SG output rows per
+// dispatch from ONE shared pass over X, instead of a hardcoded 2. See
+// matvec_f32_x2.comp's header comment for the underlying motivation this
+// generalizes — amortizing subgroupAdd()'s fixed reduction latency across
+// more work per dispatch, since a single row's dot product often doesn't
+// have enough real work to hide that latency on its own.
+//
+// ROWS_PER_SG=1 is a deliberate sanity baseline: with it, this shader's
+// dispatch shape and output are equivalent to plain matvec_f32.comp's
+// (see rawllm_vulkan.hpp's pipeline_f32_multirow_1_ comment) — test that
+// value first, since a mismatch there means a bug in THIS file, not in
+// the row-multiplexing idea. ROWS_PER_SG=2 is equivalent in shape to
+// matvec_f32_x2.comp; ROWS_PER_SG=4 is new territory.
+//
+// ROWS_PER_SG is a SPECIALIZATION CONSTANT (constant_id = 0), resolved
+// once per pipeline at rawllm_vulkan.hpp's build_pipeline_multirow()
+// time via VkSpecializationInfo — NOT a per-dispatch runtime value.
+// create_pipelines() builds three separate VkPipeline objects from this
+// ONE SPIR-V module (values 1, 2, 4), each with the constant baked in at
+// pipeline-creation time, the same way build_pipeline_specialized() (see
+// matmul_coopmat_f16.comp) bakes in a workgroup size. Because a GLSL
+// array's length must be a real constant (specialization-constant-sized
+// arrays are not reliably supported across drivers), acc[]/row[]/have[]
+// below are sized to MAX_ROWS_PER_SG (a literal 4), never to ROWS_PER_SG
+// directly, and every loop over them is bounded by ROWS_PER_SG, which is
+// always <= MAX_ROWS_PER_SG. build_pipeline_multirow() asserts
+// rows_per_sg <= 4 host-side specifically because this shader has no way
+// to check that itself: a caller-supplied value bigger than 4 would loop
+// past these arrays' real bound and silently corrupt adjacent register
+// state rather than fail cleanly — that assertion is the only thing
+// standing between a host-side typo and that.
+//
+// Contract (must match rawllm_vulkan.hpp's queue_matvec_f32_multirow() /
+// record_dispatch_multirow()):
+//   binding 0: W — row-major float matrix, vec4[rows*cols/4] — SAME
+//                  layout as matvec_f32.comp's W (upload_weight_f32(),
+//                  unchanged; this is F32, not fp16 — that's the
+//                  separate matvec_f16.comp experiment)
+//   binding 1: x — shared activation vector, vec4[cols/4]
+//   binding 2: y — output vector, rows floats (writeonly)
+//   push constants: { uint cols; uint rows; } — cols MUST be a multiple
+//                  of 4 (same requirement as matvec_f32.comp; no scalar
+//                  fallback shipped for this variant)
+//   dispatch: vkCmdDispatch(ceil(rows / (rows_per_workgroup*ROWS_PER_SG)), 1, 1)
+//             — each workgroup covers rows_per_workgroup*ROWS_PER_SG
+//             output rows (ROWS_PER_SG per subgroup). Dispatching this
+//             shader with matvec_f32.comp's or matvec_f32_x2.comp's own
+//             group-count formula under-dispatches whenever ROWS_PER_SG
+//             > 1 for THIS pipeline — record_dispatch_multirow() already
+//             accounts for this, see that function's comment.
+//
+// have[r] (and therefore whether row r's subgroupAdd() executes at all)
+// is computed identically by every lane in a subgroup — row_base depends
+// only on gl_WorkGroupID.x and gl_SubgroupID, both uniform across a
+// subgroup's lanes, never on gl_SubgroupInvocationID — so branching on it
+// does not violate subgroup-operation uniformity requirements, same
+// reasoning as matvec_f32_x2.comp's have_row1.
+//
+// NOT DONE: have[r] is re-checked on every iteration of the main
+// accumulation loop (once per r, inside the loop over j) rather than
+// hoisted into two precompiled loop bodies the way matvec_f32_x2.comp
+// hand-splits its "both rows present" vs. "tail" cases. Since ROWS_PER_SG
+// is a specialization constant, a driver's compiler is free to unroll
+// the small (1/2/4-trip) loops below and hoist the r-indexed have[]
+// checks out of the j-loop itself, since they don't depend on j — but
+// that's an optimizer *may*, not a guarantee this file makes. If
+// profiling ever shows this branch costing real cycles inside the hot
+// loop, hand-splitting into an "all ROWS_PER_SG rows present" fast path
+// and a separate tail path (matvec_f32_x2.comp's approach, generalized)
+// is the next thing to try — not attempted here, to keep this first
+// generalized version simple enough to actually validate.
+//
+// VALIDATION STATUS: written to compile against this repo's established
+// GLSL baseline (same #version/extensions/subgroup-pinning approach as
+// matvec_f32.comp and matvec_f32_x2.comp) and the uniformity/bounds
+// reasoning above was checked by hand against the GLSL subgroup-
+// operations spec, but this has NOT been run through glslangValidator,
+// checked against a CPU reference, or dispatched on any GPU yet, for ANY
+// of the three ROWS_PER_SG values. Test ROWS_PER_SG=1 first (see above),
+// then 2 and 4, and for each, test at least one `rows` value NOT evenly
+// divisible by ROWS_PER_SG — to exercise the have[r]==false tail case,
+// which ROWS_PER_SG=1 alone never reaches.
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint ROWS_PER_SG = 1u;
+const uint MAX_ROWS_PER_SG = 4u; // must match rawllm_vulkan.hpp's build_pipeline_multirow() bound
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly restrict buffer WBuf { vec4 Wv[]; };
+layout(std430, binding = 1) readonly restrict buffer XBuf { vec4 Xv[]; };
+layout(std430, binding = 2) writeonly restrict buffer YBuf { float Y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+void main() {
+    uint row_base = gl_WorkGroupID.x * (gl_NumSubgroups * ROWS_PER_SG) + gl_SubgroupID * ROWS_PER_SG;
+    if (row_base >= params.rows) return; // whole subgroup has nothing to do this dispatch
+
+    uint row[MAX_ROWS_PER_SG];
+    bool have[MAX_ROWS_PER_SG];
+    for (uint r = 0u; r < ROWS_PER_SG; ++r) {
+        row[r] = row_base + r;
+        have[r] = row[r] < params.rows;
+    }
+
+    uint vec_cols = params.cols >> 2u; // cols/4, host guarantees cols % 4 == 0
+    uint lane = gl_SubgroupInvocationID;
+    uint sg_size = gl_SubgroupSize;
+
+    vec4 acc[MAX_ROWS_PER_SG];
+    for (uint r = 0u; r < ROWS_PER_SG; ++r) acc[r] = vec4(0.0);
+
+    for (uint j = lane; j < vec_cols; j += sg_size) {
+        vec4 xv = Xv[j]; // shared load — the entire point of row-multiplexing
+        for (uint r = 0u; r < ROWS_PER_SG; ++r) {
+            if (have[r]) acc[r] += Wv[row[r] * vec_cols + j] * xv;
+        }
+    }
+
+    for (uint r = 0u; r < ROWS_PER_SG; ++r) {
+        if (have[r]) {
+            float sum = subgroupAdd(acc[r].x + acc[r].y + acc[r].z + acc[r].w);
+            if (lane == 0u) Y[row[r]] = sum;
+        }
+    }
+}
