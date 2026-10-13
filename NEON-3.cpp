@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -13,7 +14,9 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rawllm_common.hpp"
@@ -28,6 +31,7 @@
 #include "nectar_diskmem.hpp"
 #include "nectar_vision.hpp"
 #include "nectar_splice.hpp"
+#include "nectar_cot.hpp"
 #include "nectar_zram.hpp"
 #endif
 
@@ -990,6 +994,259 @@ static void run_interactive(const engine::Config& cfg,
 
 
 // =============================================================================
+// Anti-repetition for long idle generation (no retraining).
+//
+// Why the idle loop collapses: every token the model emits is fed back as
+// context, and a small LM's own recent text is the strongest signal it sees.
+// Once a phrase repeats, attention to the previous copy makes the next copy
+// more likely (self-reinforcing). Plain temperature/top-p can't break that.
+// Three cheap, retrain-free countermeasures live here:
+//   1. repetition/frequency penalty over a recent window (logit-level)
+//   2. no-repeat n-gram ban (hard: never complete an n-gram already seen)
+//   3. loop detector, used by the idle loop to inject a steering turn
+// =============================================================================
+struct AntiRepeat {
+    // v2: v1's 1.15 penalty over ALL tokens (incl. "the", ",", ".") starved the
+    // model of punctuation/function words and produced run-on word salad.
+    // Penalties now touch only content-word tokens, and are much gentler.
+    float  rep_penalty      = 1.08f;  // >1 discourages content words seen in window (1.0 = off)
+    float  freq_penalty     = 0.0f;   // subtracted per prior occurrence in window (content words only)
+    size_t window           = 128;    // how far back penalties look
+    int    no_repeat_ngram  = 8;      // 0 = off; only blocks verbatim copy-loops at this length
+    float  min_p            = 0.05f;  // drop tokens < min_p * p(top); cuts the weird-word tail
+    size_t turn_tokens      = 200;    // soft cap: end the assistant turn at the next sentence end
+    size_t max_runon        = 60;     // tokens without . ! ? or newline => degraded, rewind
+};
+
+// Tokens eligible for repetition penalty: plain alphabetic words, 4+ letters
+// (after the byte-BPE space marker). Punctuation, digits, newlines, short
+// function words and special tokens are never penalized.
+static std::vector<char> build_penalty_mask(const std::vector<std::string>& toks, size_t n_vocab)
+{
+    std::vector<char> m(n_vocab, 0);
+    for (size_t i = 0; i < toks.size() && i < n_vocab; ++i) {
+        const std::string& t = toks[i];
+        size_t b = 0;
+        if (t.size() >= 2 && (unsigned char)t[0] == 0xC4 && (unsigned char)t[1] == 0xA0) b = 2;  // 'Ġ'
+        size_t len = t.size() - b;
+        if (len < 4) continue;
+        { const std::string w = t.substr(b); if (w == "think" || w == "answer") continue; }  // tag words must stay cheap to emit
+        bool ok = true;
+        for (size_t j = b; j < t.size(); ++j)
+            if (!std::isalpha((unsigned char)t[j])) { ok = false; break; }
+        m[i] = ok ? 1 : 0;
+    }
+    return m;
+}
+
+static void apply_anti_repeat(std::vector<float>& logits,
+                              const std::vector<int32_t>& hist,
+                              size_t pinned, const AntiRepeat& ar,
+                              const std::vector<char>& mask)
+{
+    const size_t V = logits.size();
+    const size_t end = hist.size();
+
+    if (end > pinned && (ar.rep_penalty != 1.0f || ar.freq_penalty != 0.0f)) {
+        const size_t start = std::max(pinned, end > ar.window ? end - ar.window : (size_t)0);
+        std::unordered_map<int32_t, int> counts;
+        for (size_t i = start; i < end; ++i) ++counts[hist[i]];
+        for (const auto& kv : counts) {
+            if (kv.first < 0 || (size_t)kv.first >= V || !mask[kv.first]) continue;
+            float& l = logits[kv.first];
+            if (ar.rep_penalty != 1.0f) l = (l > 0.f) ? l / ar.rep_penalty : l * ar.rep_penalty;
+            l -= ar.freq_penalty * (float)kv.second;
+        }
+    }
+
+    const int n = ar.no_repeat_ngram;
+    if (n >= 2 && end > pinned && (end - pinned) >= (size_t)n) {
+        const size_t m = (size_t)n - 1;
+        const size_t scan_from = std::max(pinned, end > 2048 ? end - 2048 : (size_t)0);
+        for (size_t i = scan_from; i + m < end; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < m; ++j)
+                if (hist[i + j] != hist[end - m + j]) { match = false; break; }
+            if (match) {
+                int32_t banned = hist[i + m];
+                if (banned >= 0 && (size_t)banned < V) logits[banned] = -1e30f;
+            }
+        }
+    }
+
+    if (ar.min_p > 0.f) {
+        float mx = *std::max_element(logits.begin(), logits.end());
+        float thr = mx + std::log(ar.min_p);
+        for (auto& l : logits) if (l < thr) l = -1e30f;
+    }
+}
+
+// True if the recent tail looks like a loop: very low token diversity, or the
+// last 16 tokens already occurred earlier in the last 512.
+static bool looks_like_loop(const std::vector<int32_t>& hist, size_t pinned)
+{
+    if (hist.size() < pinned + 96) return false;
+    const size_t end = hist.size();
+    {
+        const size_t w = 96;
+        std::unordered_set<int32_t> uniq(hist.end() - w, hist.end());
+        if ((double)uniq.size() / (double)w < 0.40) return true;
+    }
+    const size_t k = 16;
+    const size_t scan_from = std::max(pinned, end > 512 ? end - 512 : (size_t)0);
+    for (size_t i = scan_from; i + k < end - k; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < k; ++j)
+            if (hist[i + j] != hist[end - k + j]) { match = false; break; }
+        if (match) return true;
+    }
+    return false;
+}
+
+// Steering prompts are anchored to the topic and ask for ONE SHORT paragraph.
+// Short, well-formed turns are what a small instruct model is good at, and
+// they keep every turn inside its trained length distribution (the model
+// degrades when a single assistant turn runs for 600+ tokens).
+static std::string make_steer(size_t idx, const std::string& topic)
+{
+    static const char* aspects[] = {
+        "its history and origins",
+        "a specific real-world example",
+        "its main criticisms and limitations",
+        "how it works in practice day to day",
+        "the biggest challenges it faces today",
+        "a common misconception about it",
+        "how it compares with a similar alternative",
+        "what might change about it in the future",
+    };
+    const std::string subj = topic.empty() ? "the topic" : topic;
+    return "Continue explaining " + subj + ", now focusing on " +
+           aspects[idx % (sizeof(aspects) / sizeof(aspects[0]))] +
+           ". Write one short paragraph of 3 to 5 complete sentences and do not repeat earlier points.";
+}
+
+// =============================================================================
+// Standby CoT cycle (--idle-cot)
+//
+//   <think> ...private reasoning... </think> <answer> ...result... </answer>
+//   -> runtime injects the next <think> with a NEW stimulus -> repeat forever
+//
+// The runtime owns the structure; the model only fills in the text:
+//   * the format is taught in-context (pinned system prompt + one worked example)
+//   * the closing/opening tags are INJECTED by the runtime, not sampled, so the
+//     structure cannot be lost even if the 1.7B model forgets it
+//   * a fresh stimulus (lore line / vision delta / built-in curiosity prompt)
+//     opens every think block, which is what moves it off the old topic
+//   * when nothing is queued it sometimes spends the cycle on a question for
+//     the user; typed lines on stdin interrupt at any time and get a real reply
+// =============================================================================
+struct CotConfig {
+    bool   enabled              = false;
+    bool   default_seed         = false;   // build the built-in CoT system prompt as the pinned seed
+    bool   hide_think           = false;   // keep <think>/<next> text off stdout (still in context + disk log)
+    bool   user_input           = true;    // read stdin lines as user events
+    size_t think_tokens         = 100;     // soft cap for the whole think block (2 short fields)
+    size_t answer_tokens        = 120;     // soft cap per idle answer (x2 when answering the user)
+    size_t field_tokens         = 40;      // soft cap per think field
+    size_t next_tokens          = 30;      // soft cap for the model's own "what next" line
+    size_t min_think_tokens     = 4;       // tokens each think field must contain before it may end
+    size_t min_answer_tokens    = 12;
+    long   ask_timeout_s        = 120;     // stop waiting for a user reply after this long
+    int    lore_percent         = 15;      // chance a cycle opens with a lore line instead of the model's own next step
+    std::string task;                      // a prompt to FOLLOW first
+    std::string system_text;               // replaces the built-in system prompt (loaded from --idle-system-file)
+    std::string input_file;                // second input route: every line appended to this file is a user message
+    std::vector<std::string> stimuli;      // [0, n_lore) = lore lines, then built-in fallbacks
+    size_t n_lore               = 0;
+    float  speak_bias           = -1.0f;   // logit added to "Reply: yes" on self-directed cycles (negative = lean toward staying silent)
+    float  user_speak_bias      = 0.5f;    // same, when the cycle answers a user message (never forced either way)
+    bool   input_line           = false;   // pinned "> " input line on the bottom terminal row; model output scrolls above it
+    bool   no_echo              = false;   // turn the terminal's input echo off (typed text no longer lands inside the output)
+    size_t ask_gap              = 10;      // minimum cycles between questions to the user (no "want more?" after every answer)
+    int    ask_after_user_percent = 25;    // chance that finishing a reply to the user leads it to consider checking in at all
+    size_t speak_gap            = 5;       // cycles it stays quiet after speaking: a person says a thing once, then lets it land
+    size_t quiet_cycles         = 8;       // after the model stays silent on a user message, no new questions for this many cycles
+};
+
+static const char* kCotBuild = "cot-build 11 (pacing + visible input line + rare check-ins)";   // printed at startup so a stale binary is obvious
+
+// Events from outside the generation loop (typed lines, vision deltas, future tool results).
+static mstream::SpliceQueue g_splice;
+
+static std::vector<std::string> default_stimuli()
+{
+    return {
+        "Explain how an everyday object works, such as a refrigerator or a bicycle.",
+        "Think of an interesting fact about the ocean and explain why it matters.",
+        "Describe a simple idea from mathematics in plain words.",
+        "Pick a historical invention and explain how it changed daily life.",
+        "Imagine a small problem a person might have today and suggest a practical fix.",
+        "Explain how plants turn sunlight into food.",
+        "Think about how a computer stores and retrieves a file.",
+        "Describe how weather forecasts are made.",
+        "Pick an animal and explain one surprising thing about how it lives.",
+        "Explain the difference between weather and climate.",
+        "Think about why bridges stay up and what can make them fail.",
+        "Describe how a language changes over hundreds of years.",
+        "Explain how vaccines train the immune system.",
+        "Think about what makes a good habit stick.",
+        "Describe how electricity gets from a power plant to a home.",
+        "Explain how sound travels and why echoes happen.",
+        "Pick a city and describe what makes its layout unusual.",
+        "Think about how maps are made and why every flat map distorts something.",
+        "Explain how a simple machine like a lever gives you an advantage.",
+        "Describe how the moon affects the tides.",
+        "Think about how to learn a new skill efficiently.",
+        "Explain how money moves when you pay by card.",
+        "Describe what happens inside a volcano before it erupts.",
+        "Think about why stories are easier to remember than lists of facts.",
+    };
+}
+
+// Pinned seed that teaches the format in-context. `<|im_start|>` is omitted
+// when the tokenizer's BOS id already IS <|im_start|> (add_bos=true prepends
+// it), so the sequence never starts with two.
+// The built-in system prompt (the standby format). Replaceable with --idle-system-file.
+static std::string default_cot_system_text()
+{
+    return std::string(
+         "You are NANITY, a small autonomous assistant. When no user is typing you are in standby: you think on your own and decide for yourself what to do next.\n"
+         "Every reply has this format:\n"
+         "<think>\nTask: one line saying what is being asked or noticed.\nPlan: one line saying what to do.\nReply: yes or no\n</think>\n"
+         "<answer>\nThe answer, in first person. Only write this part when Reply is yes.\n</answer>\n"
+         "<next>\nOne line saying what you will do next.\n</next>\n"
+         "Rules: keep the think block to those three short lines and never repeat them in the answer. "
+         "Reply yes only when the user needs or asked to hear something now. "
+         "Reply no when there is nothing to say, when the user is finished (for example \"thanks, that's all\"), or when a note is only something to think about quietly; "
+         "then skip the answer and go straight to <next>. "
+         "Keep answers short, 3 to 5 sentences. "
+         "Explain a thing once, like a person would: never repeat yourself or go back over a topic you already covered, unless you realize you left out something important. "
+         "After you ask the user something, wait quietly for their reply (Reply: no) and keep thinking. "
+         "Messages starting with [Self-note] are your own private plans, not questions from the user: carry them out in first person and never praise or comment on them. "
+         "If a self-note says to ask the user something, reply yes and make the answer that question, addressed directly to the user. "
+         "Never start an answer with praise such as \"Great question\". "
+         "What you do next can be anything that fits: look deeper at a detail, double-check something you said, move to a related topic, "
+         "ask the user something, check in with the user, or wait for their reply.\n"
+         "Example 1:\n"
+         "<think>\nTask: Explain how rainbows form.\nPlan: Mention sunlight entering raindrops, bending, reflecting inside, and spreading into colors.\nReply: yes\n</think>\n"
+         "<answer>\nA rainbow forms when sunlight enters raindrops, reflects off the inside, and exits, with each color bending at a slightly "
+         "different angle. That spreads white light into a band of colors.\n</answer>\n"
+         "<next>\nI could explain why rainbows are curved.\n</next>\n"
+         "Example 2:\n"
+         "<think>\nTask: The user said thanks and is finished.\nPlan: Nothing to add, so stay quiet.\nReply: no\n</think>\n"
+         "<next>\nI could think about something I am curious about on my own.\n</next>\n");
+}
+
+static std::string build_cot_seed(const Tokenizer& tok, const std::string& task, const std::string& system_override)
+{
+    auto it = tok.vocab_map.find("<|im_start|>");
+    const bool bos_is_im_start = (it != tok.vocab_map.end() && it->second == tok.bos_id);
+    return cotx::compose_seed(bos_is_im_start,
+                              system_override.empty() ? default_cot_system_text() : system_override,
+                              task.empty() ? std::string("Standby mode. Pick something interesting to explain.") : task);
+}
+
+// =============================================================================
 // Idle loop (NECTAR idle-loop architecture v3, §8 build-order step 1):
 // continuous streaming generation with StreamingLLM-style sink/window
 // eviction, so idle CoT can run indefinitely on a fixed-size context
@@ -1107,7 +1364,11 @@ static void run_idle_loop(const engine::Config& cfg,
                            size_t zram_ring_capacity,
                            const std::string& zram_index_path,
                            size_t summary_max_tokens,
-                           double zram_max_keep_fraction) // cap on keep/kv_window before a summary stops being pinned
+                           double zram_max_keep_fraction, // cap on keep/kv_window before a summary stops being pinned
+                           const AntiRepeat& anti_repeat,
+                           bool   steer_enabled,
+                           const std::string& steer_topic,
+                           const CotConfig& cot)
 {
     auto& st = get_engine_state(cfg, gguf);
     std::mt19937 rng(std::random_device{}());
@@ -1130,7 +1391,12 @@ static void run_idle_loop(const engine::Config& cfg,
     // ---- Build the pinned region: implant block (§3/§4 — seed_text is now
     // the actual compressed personality distillation, not a stand-in;
     // §8 step 2) followed by optional dedicated neutral sink tokens (§1).
-    std::vector<int32_t> pinned = tok.encode(seed_text, /*add_bos=*/true);
+    std::string first_stim;                                   // used as the first user turn when no --idle-task is given
+    if (cot.enabled && cot.task.empty() && !cot.stimuli.empty())
+        first_stim = cot.stimuli[(size_t)std::chrono::steady_clock::now().time_since_epoch().count() % cot.stimuli.size()];
+    const std::string seed_task = cot.task.empty() ? (first_stim.empty() ? std::string() : "[Standby] " + first_stim) : cot.task;
+    const std::string seed_eff = (cot.enabled && cot.default_seed) ? build_cot_seed(tok, seed_task, cot.system_text) : seed_text;
+    std::vector<int32_t> pinned = tok.encode(seed_eff, /*add_bos=*/true);
     const size_t seed_len = pinned.size();
 
     if (sink_tokens > 0) {
@@ -1283,21 +1549,278 @@ static void run_idle_loop(const engine::Config& cfg,
         chunk_range_start = range_end;
     };
 
-    long produced = 0;
+    const std::vector<char> penal_mask = build_penalty_mask(tok.meta.tokens, cfg.n_vocab);
+    const bool managed = steer_enabled || cot.enabled;   // output is held until a sentence completes
+
+    long   produced = 0;
+    size_t steer_idx = 0;
+    std::string pending_out;
+    size_t appended_since_cp = 0;      // cache positions appended since the last-sentence-end checkpoint
+    bool   cp_valid          = true;
+    size_t since_sent_end    = 0;
+    size_t turn_tokens       = 0;
+
+    // ---- CoT state. One cycle = one ChatML exchange:
+    //   user turn  : a user message, an [Event], or a [Self-note] (the model's own previous <next> line)
+    //   assistant  : <think>Task/Plan</think> <answer>..</answer> <next>the model's own next step</next>
+    enum class Phase { THINK, ANSWER, NEXT };
+    enum class Kind  { NORMAL, ASK, USER };
+    Phase  phase = Phase::THINK;
+    Kind   kind  = Kind::NORMAL;
+    size_t phase_tokens = 0, think_field = 0, field_tokens = 0;
+    long   cycle_no = 0;
+    const std::vector<std::string> think_labels = { "Task:", "Plan:" };
+    std::string tail, answer_text, next_text, next_opener, last_note;
+    std::deque<std::string> recent_notes;
+    std::deque<size_t>      recent_stim;
+    // Conversation state: after the model asks the user something it keeps thinking
+    // (cycles go on) until a reply is spliced in or the wait times out.
+    bool        awaiting = false;
+    std::string pending_question;
+    auto        asked_at = std::chrono::steady_clock::now();
+
+    const cotx::TagVocab tv = cotx::build_tag_vocab(tok.meta.tokens, (size_t)cfg.n_vocab);
+    std::vector<int32_t> praise_ids;                     // opening-praise tokens ("Great", "Thanks", ...)
+    const cotx::ChoiceVocab cv = cotx::build_choice_vocab(tok.meta.tokens, (size_t)cfg.n_vocab);
+    bool   deciding = false;      // the think block is at its "Reply:" field: the model picks yes (speak) or no (stay in thought)
+    bool   spoke = false;         // this cycle produced an <answer>
+    bool   event_cycle = false;   // this cycle was opened by an outside event (vision / tool)
+    size_t ask_cooldown = 0;      // cycles during which new questions are suspended
+    size_t cycles_since_ask = 1000;   // cycles since the last question to the user
+    bool   ask_suppressed = false;    // the model wanted to check in, but it is too soon: keep that as a private thought
+    size_t speak_cooldown = 0;    // cycles it stays quiet after speaking
+    bool   override_repeat = false;   // a self-declared correction may revisit a topic it already covered
+    bool   force_quiet = false;       // a pacing rule decided this cycle's Reply
+    std::string quiet_why, task_text;
+    std::vector<std::string> covered; // Task lines of what has already been said
+    for (const char* w : {"Great", "Good", "Excellent", "Thank", "Thanks", "Sure", "Certainly",
+                          "Absolutely", "Indeed", "Wow", "Interesting", "Your", "You"})
+        for (const std::string& key : std::vector<std::string>{ std::string(w), std::string("\xC4\xA0") + w }) {
+            auto it = tok.vocab_map.find(key);
+            if (it != tok.vocab_map.end()) praise_ids.push_back(it->second);
+        }
+
+    auto emit = [&](const std::string& t) {
+        if (cot.enabled && cot.hide_think && (phase == Phase::THINK || phase == Phase::NEXT)) return;
+        if (managed) pending_out += t; else std::cout << t << std::flush;
+    };
+    auto flush_out = [&]() {
+        if (!pending_out.empty()) { std::cout << pending_out << std::flush; pending_out.clear(); }
+    };
+    // Splice text into the live context (cache + token history + aging buffer).
+    auto inject = [&](const std::string& text) {
+        std::vector<int32_t> toks = tok.encode(text, /*add_bos=*/false);
+        if (toks.empty()) return;
+        mstream::push_injected_text(aging, toks.size(), text);
+        size_t d = ensure_cache_room(cfg, st, toks.size(), keep);
+        for (size_t i = 0; i < d && !aging.empty(); ++i) { evict_piece(aging.front()); aging.pop_front(); }
+        fwd::transformer_forward(cfg, st.mw, toks, st.cache, logits.data(), pool);
+        st.cached_tokens.insert(st.cached_tokens.end(), toks.begin(), toks.end());
+        appended_since_cp = 0; cp_valid = true; since_sent_end = 0; tail.clear();   // injection point is a consistent checkpoint
+    };
+    // Truncate the KV cache back to the last sentence end: the degraded tokens
+    // never happened as far as the model is concerned.
+    auto try_rewind = [&]() -> bool {
+        if (!(cp_valid && appended_since_cp > 0 &&
+              appended_since_cp <= st.cached_tokens.size() &&
+              appended_since_cp <= st.cache.length &&
+              (st.cache.length - appended_since_cp) > keep)) return false;
+        const size_t n = appended_since_cp;
+        st.cache.length -= n;
+        st.cached_tokens.resize(st.cached_tokens.size() - n);
+        for (size_t i = 0; i < n && !aging.empty(); ++i) aging.pop_back();
+        pending_out.clear();
+        (void)tok.flush();
+        appended_since_cp = 0; since_sent_end = 0; tail.clear();
+        return true;
+    };
+    auto pick_from = [&](size_t lo, size_t hi) -> std::string {   // random stimulus in [lo,hi), avoiding recent picks
+        if (hi <= lo || hi > cot.stimuli.size()) return "Pick any interesting topic and think about it.";
+        size_t idx = lo;
+        for (int tries = 0; tries < 8; ++tries) {
+            idx = lo + (size_t)(rng() % (hi - lo));
+            if (std::find(recent_stim.begin(), recent_stim.end(), idx) == recent_stim.end()) break;
+        }
+        recent_stim.push_back(idx);
+        if (recent_stim.size() > std::min<size_t>(8, (hi - lo) / 2)) recent_stim.pop_front();
+        return cot.stimuli[idx];
+    };
+    auto shorten = [](std::string t, size_t n) { if (t.size() > n) { t.resize(n); t += "..."; } return t; };
+
+    // Open the next exchange. What it is about comes from, in order:
+    //   1. a queued outside event (vision / tool)            -> [Event]
+    //   2. occasionally a lore line                          -> [Self-note]
+    //   3. the model's OWN <next> line from the last cycle   -> [Self-note]   (asks the user if the model said so)
+    //   4. a built-in stimulus, only if the model's line was empty / too short / a near-copy
+    auto begin_next_cycle = [&](bool first) {
+        std::string pre, utext;
+        event_cycle = false;
+        if (first) {
+            kind = cot.task.empty() ? Kind::NORMAL : Kind::USER;
+            if (!cot.default_seed && !cot.task.empty())
+                pre = "<|im_end|>\n<|im_start|>user\n" + cot.task + "<|im_end|>\n<|im_start|>assistant\n";
+            if (!cot.task.empty()) pending_out += "[TASK] " + cot.task + "\n";
+        } else {
+            std::string label = "[Self-note] ", text;
+            kind = Kind::NORMAL;
+            if (ask_cooldown > 0) --ask_cooldown;
+            if (cycles_since_ask < 100000) ++cycles_since_ask;
+            ask_suppressed = false;
+            mstream::SpliceEvent ev;
+            const bool from_event = g_splice.try_pop_other(ev);
+            event_cycle = from_event;
+            // Questions are only allowed when not already waiting for a reply and not in the quiet period
+            // that follows the model choosing silence on a user message (e.g. "I am satisfied").
+            const cotx::NextKind nk = cotx::classify_next(last_note);
+            const bool note_asks = nk == cotx::NextKind::Ask;
+            const bool note_corrects = nk == cotx::NextKind::Correct;
+            const bool may_ask = !awaiting && ask_cooldown == 0 && cycles_since_ask >= cot.ask_gap;
+            if (speak_cooldown > 0) --speak_cooldown;
+            override_repeat = false;
+            if (from_event) {
+                label = "[Event] ";
+                text = ev.text;
+            } else if (cot.n_lore > 0 && (int)(rng() % 100) < cot.lore_percent) {
+                text = "Something from my background: " + pick_from(0, cot.n_lore);
+            } else if (cotx::note_is_usable(last_note, recent_notes) &&
+                       (note_corrects || !cotx::repeats_topic(last_note, covered))) {   // no going back over covered ground...
+                kind = (note_asks && may_ask) ? Kind::ASK : Kind::NORMAL;
+                ask_suppressed = note_asks && !may_ask;       // too soon to check in again: it stays a private thought
+                if (kind == Kind::ASK) cycles_since_ask = 0;
+                override_repeat = note_corrects;                                       // ...unless it says it left something out
+                text = last_note;
+                recent_notes.push_back(last_note);
+                if (recent_notes.size() > 4) recent_notes.pop_front();
+            } else {
+                text = "Something to think about: " + pick_from(0, cot.stimuli.size());
+            }
+            if (awaiting && !from_event) {
+                const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - asked_at).count();
+                if (waited > (double)cot.ask_timeout_s) {
+                    text = "The user has not replied to \"" + shorten(pending_question, 100) + "\". " + text;
+                    awaiting = false;
+                } else {
+                    text = "I am still waiting for the user to answer \"" + shorten(pending_question, 100) + "\". Meanwhile: " + text;
+                }
+            }
+            utext = label + text;
+            pre = "<|im_end|>\n<|im_start|>user\n" + utext + "<|im_end|>\n<|im_start|>assistant\n";
+        }
+        const std::string first_label = (kind == Kind::ASK) ? std::string("Task: Ask the user one short question about") : think_labels[0];
+        inject(pre + "<think>\n" + first_label);
+        phase = Phase::THINK; phase_tokens = 0; think_field = 0; field_tokens = 0; ++cycle_no;
+        deciding = false; spoke = false; force_quiet = false;
+        answer_text.clear(); next_text.clear(); task_text.clear();
+        emit("\n<think>\n" + first_label);
+        std::cerr << "[Idle][cot] cycle " << cycle_no
+                  << (kind == Kind::ASK ? " -> asking the user" : (kind == Kind::USER ? " -> following the prompt" : ""))
+                  << (awaiting ? " (waiting for user reply)" : "")
+                  << (utext.empty() ? std::string() : ": " + utext.substr(0, 110)) << "\n";
+    };
+
+    bool input_line_on = false;
+    if (cot.enabled && cot.user_input) {
+        if (cot.input_line) input_line_on = mstream::start_input_line(g_splice);          // needs stdin AND stdout on a terminal
+        if (!input_line_on) mstream::start_stdin_pump(g_splice);
+        std::cerr << (input_line_on
+            ? "[Idle][cot] input line active on the bottom row of the terminal (Ctrl-C quits and restores the terminal)\n"
+            : "[Idle][cot] type a line + Enter to talk to it; it is spliced in at the next sentence end, answered, then standby thinking resumes\n");
+        if (cot.input_line && !input_line_on) std::cerr << "[Idle][cot] --idle-input-line needs a terminal on stdin and stdout; using plain stdin instead\n";
+    }
+    if (cot.enabled && cot.user_input && cot.no_echo && !input_line_on) {
+        if (mstream::disable_tty_echo()) std::cerr << "[Idle][cot] terminal echo off (restored on exit and on Ctrl-C)\n";
+        else std::cerr << "[Idle][cot] --idle-no-echo ignored: stdin is not a terminal\n";
+    }
+    if (cot.enabled && !cot.input_file.empty()) {
+        mstream::start_file_pump(g_splice, cot.input_file);
+        std::cerr << "[Idle][cot] also reading user lines appended to " << cot.input_file << "\n";
+    }
+    if (cot.enabled) {   // on stdout on purpose: stderr is often redirected to a log
+        std::cout << "[" << kCotBuild << "]\n[input] " << (!cot.user_input ? "stdin input is off" : (input_line_on ? "type in the bottom line + Enter" : "type a line + Enter"))
+                  << (cot.input_file.empty() ? std::string() : std::string(" or append a line to ") + cot.input_file)
+                  << " - it is spliced in at the end of the current sentence and shown as [USER]\n" << std::flush;
+    }
+
+    auto suppress_special = [&](std::vector<float>& l) {
+        if (tok.eos_id >= 0 && (size_t)tok.eos_id < l.size()) l[tok.eos_id] = -1e30f;   // <|im_end|>: the runtime closes turns, not the model
+        if (tok.bos_id >= 0 && (size_t)tok.bos_id < l.size()) l[tok.bos_id] = -1e30f;   // <|im_start|>
+    };
+    auto sample_next = [&]() -> int32_t {
+        std::vector<float> adj(logits.begin(), logits.end());
+        bool in_tag = false;
+        if (cot.enabled) {
+            suppress_special(adj);
+            // Structure guard: the runtime injects every OPENING tag, so the model may only ever
+            // produce closing ones. Opening-tag tokens are banned; after a bare "<" only "/" may
+            // follow; after "</" only this block's own word (think / answer / next).
+            for (int32_t id : tv.lt_open) adj[(size_t)id] = -1e30f;
+            auto restrict_to = [&](const std::vector<int32_t>& ids) {
+                if (ids.empty()) return;
+                std::vector<std::pair<int32_t, float>> saved;
+                saved.reserve(ids.size());
+                for (int32_t id : ids) saved.emplace_back(id, adj[(size_t)id]);
+                std::fill(adj.begin(), adj.end(), -1e30f);
+                for (const auto& pr : saved) adj[(size_t)pr.first] = pr.second;
+            };
+            if (!tail.empty() && tail.back() == '<') restrict_to(tv.slash);
+            else if (tail.size() >= 2 && tail.compare(tail.size() - 2, 2, "</") == 0) restrict_to(tv.close_word[(int)phase]);
+
+            const size_t lt = tail.rfind('<');
+            in_tag = (lt != std::string::npos && tail.find('>', lt) == std::string::npos);   // mid-tag: leave it alone
+            if (!in_tag) {
+                size_t since, min_p;
+                if (phase == Phase::THINK)     { since = field_tokens; min_p = cot.min_think_tokens; }
+                else if (phase == Phase::NEXT) { since = phase_tokens; min_p = 3; }
+                else                           { since = phase_tokens; min_p = cot.min_answer_tokens; }
+                if (since < min_p) {                                     // force real content before a field/block can end
+                    for (int32_t id : tv.lt) adj[(size_t)id] = -1e30f;
+                    if (phase != Phase::ANSWER) for (int32_t id : tv.nl) adj[(size_t)id] = -1e30f;
+                }
+                if (phase == Phase::ANSWER && phase_tokens < 2)          // no "Great question!" openers
+                    for (int32_t id : praise_ids) adj[(size_t)id] = -1e30f;
+            }
+        }
+        if (cot.enabled && deciding) {                                   // the Reply field: a forced choice, free to go either way
+            // Asking the user always means speaking; a user message leans neutral; idle notes lean quiet.
+            float bias = (kind == Kind::ASK) ? 1000.f
+                       : (kind == Kind::USER ? cot.user_speak_bias
+                       : (event_cycle ? 0.f : (override_repeat ? 2.0f : cot.speak_bias)));
+            if (force_quiet) bias = -1000.f;                             // pacing rule: this cycle stays in thought
+            std::vector<std::pair<int32_t, float>> saved;
+            for (int32_t id : cv.yes) saved.emplace_back(id, adj[(size_t)id] + bias);
+            for (int32_t id : cv.no)  saved.emplace_back(id, adj[(size_t)id]);
+            if (!saved.empty()) {
+                std::fill(adj.begin(), adj.end(), -1e30f);
+                for (const auto& pr : saved) adj[(size_t)pr.first] = pr.second;
+            }
+            in_tag = true;                                               // (flag reused) skip repetition penalties for this token
+        }
+        if (!in_tag) apply_anti_repeat(adj, st.cached_tokens, keep, anti_repeat, penal_mask);
+        return sample_top_p(adj.data(), (int)cfg.n_vocab, temperature, top_p, rng);
+    };
+
+    if (cot.enabled) {
+        begin_next_cycle(/*first=*/true);
+        flush_out();
+        next = sample_next();
+    }
+
     while (max_tokens == 0 || produced < max_tokens) {
         std::string piece;
-        if (next == tok.eos_id) {
-            // Soft break, not a stop: fold EOS into the stream like a
-            // paragraph boundary and keep decoding.
-            piece = "\n";
+        const bool eos_this_step = (next == tok.eos_id);
+        if (eos_this_step) {
+            piece = "\n";   // soft break
         } else {
             piece = tok.decode_one(next);
             ++produced;
+            ++turn_tokens;
         }
-        std::cout << piece << std::flush;
-        aging.push_back(piece);   // this token now occupies a live, evictable position
+        const bool sent_end = eos_this_step || piece.find_first_of(".!?\n") != std::string::npos;
+        emit(piece);
+        aging.push_back(piece);
 
-        size_t discard = ensure_cache_room(cfg, st, 1, keep);   // may trigger a shift
+        size_t discard = ensure_cache_room(cfg, st, 1, keep);
+        if (discard > 0) cp_valid = false;
         for (size_t i = 0; i < discard && !aging.empty(); ++i) {
             evict_piece(aging.front());
             aging.pop_front();
@@ -1307,16 +1830,26 @@ static void run_idle_loop(const engine::Config& cfg,
         fwd::transformer_forward(cfg, st.mw, one_token, st.cache, logits.data(), pool);
         st.cached_tokens.push_back(next);
 
-        // ---- Vision splice point: right between finishing this token's
-        // forward pass and sampling the next one. This IS the "in-flight
-        // generation" the doc worries about pausing/splicing into — but
-        // since this loop is already synchronous and per-token, there is
-        // nothing to pause; we just forward more tokens before sampling,
-        // using the same primitives as regular generation.
-        bool injected = false;
+        if (sent_end) {
+            if (managed) flush_out();
+            appended_since_cp = 0;
+            cp_valid = true;
+            since_sent_end = 0;
+        } else {
+            ++appended_since_cp;
+            ++since_sent_end;
+        }
+
+        // ---- Vision: in CoT mode a delta is queued as an outside event (consumed at the next
+        // cycle boundary, never spliced into the middle of a block); otherwise spliced in place.
         if (vision_enabled && vision_gate.ready(std::chrono::steady_clock::now())) {
             auto delta = vis.poll();
-            if (delta) {
+            if (delta && cot.enabled) {
+                std::string d = *delta;
+                if (d.size() > kMaxAnnotationChars) d.resize(kMaxAnnotationChars);
+                g_splice.push(mstream::SpliceKind::Vision, "I just noticed on screen: " + d);
+                std::cerr << "[Idle] queued vision event: " << d << "\n";
+            } else if (delta) {
                 std::string annotation = "\n[Vision: " + *delta + "]\n";
                 if (annotation.size() > kMaxAnnotationChars) {
                     annotation.resize(kMaxAnnotationChars);
@@ -1332,13 +1865,12 @@ static void run_idle_loop(const engine::Config& cfg,
                     }
                     fwd::transformer_forward(cfg, st.mw, ann_tokens, st.cache, logits.data(), pool);
                     st.cached_tokens.insert(st.cached_tokens.end(), ann_tokens.begin(), ann_tokens.end());
-                    injected = true;
+                    cp_valid = false;
                     std::cerr << "[Idle] injected vision delta (" << ann_tokens.size()
                               << " tokens): " << *delta << "\n";
                 }
             }
         }
-        (void)injected;   // reserved for future use (e.g. re-priming sampling temperature post-injection)
 
         if (log_every > 0 && produced > 0 && produced % (long)log_every == 0) {
             std::cerr << "[Idle] produced=" << produced
@@ -1347,14 +1879,210 @@ static void run_idle_loop(const engine::Config& cfg,
                       << " disk_pending=" << idle_disk.pending_tokens() << "\n";
         }
 
-        // Samples from whichever forward pass ran last: the generated
-        // token's, or — if a splice just happened — the injected chunk's
-        // final position. Either way this is "sample the next token given
-        // everything currently in context," which is exactly what should
-        // happen post-injection: no separate re-priming step needed.
-        next = sample_top_p(logits.data(), (int)cfg.n_vocab, temperature, top_p, rng);
+        if (cot.enabled) {
+            // ================= CoT cycle management =================
+            tail += piece;
+            if (tail.size() > 32) tail.erase(0, tail.size() - 32);
+            ++phase_tokens;
+            if (phase == Phase::THINK)  ++field_tokens;
+            if (phase == Phase::ANSWER) answer_text += piece;
+            if (phase == Phase::THINK && think_field == 0) task_text += piece;
+            if (phase == Phase::NEXT)   next_text += piece;
+
+            // (a) A user event is spliced in at the next sentence end (or after 24 tokens without one):
+            //     close whatever is open, answer the user, then standby thinking resumes after that answer.
+            bool handled_user = false;
+            if (g_splice.has_user() && (sent_end || since_sent_end >= 24 || phase_tokens < 2)) {
+                mstream::SpliceEvent ev;
+                if (g_splice.try_pop_user(ev)) {
+                    handled_user = true;
+                    flush_out();
+                    const char* closer = (phase == Phase::THINK) ? "\n</think>\n<answer>\n(one moment)\n</answer>"
+                                       : (phase == Phase::NEXT ? "\n</next>" : "\n</answer>");
+                    phase = Phase::ANSWER;
+                    emit("\n[USER] " + ev.text + "\n");
+                    flush_out();
+                    inject(std::string(closer) + "<|im_end|>\n<|im_start|>user\n" + ev.text +
+                           "<|im_end|>\n<|im_start|>assistant\n<think>\n" + think_labels[0]);
+                    kind = Kind::USER; awaiting = false; deciding = false; spoke = false; event_cycle = false;
+                    override_repeat = false; force_quiet = false; ask_suppressed = false; task_text.clear();
+                    phase = Phase::THINK; phase_tokens = 0; think_field = 0; field_tokens = 0;
+                    answer_text.clear(); next_text.clear();
+                    emit("<think>\n" + think_labels[0]);
+                    std::cerr << "[Idle][cot] user event spliced in -> replying\n";
+                }
+            }
+
+            if (!handled_user) {
+                // (b) tag detection (model-closed), caps, and degradation (run-on / loop)
+                bool degraded = false;
+                const char* why = "";
+                if (since_sent_end >= anti_repeat.max_runon) { degraded = true; why = "run-on"; }
+                else if (phase != Phase::NEXT && phase_tokens >= 24 && looks_like_loop(st.cached_tokens, keep)) { degraded = true; why = "loop"; }
+
+                const bool t_closed   = phase == Phase::THINK  && tail.find("</think>") != std::string::npos;
+                const bool t_answered = phase == Phase::THINK  && tail.find("<answer>") != std::string::npos;
+                const bool a_closed   = phase == Phase::ANSWER && tail.find("</answer>") != std::string::npos;
+                const bool a_thinks   = phase == Phase::ANSWER && tail.find("<think>")  != std::string::npos;
+                const bool n_closed   = phase == Phase::NEXT   && tail.find("</next>")  != std::string::npos;
+                const bool next_end   = phase == Phase::NEXT   && piece.find('\n') != std::string::npos;
+                const size_t cap = (phase == Phase::THINK) ? cot.think_tokens
+                                 : (phase == Phase::NEXT ? cot.next_tokens
+                                 : (kind == Kind::USER ? cot.answer_tokens * 2
+                                 : (kind == Kind::ASK ? std::min<size_t>(cot.answer_tokens, 48) : cot.answer_tokens)));
+                const bool field_step = phase == Phase::THINK &&
+                    (piece.find('\n') != std::string::npos || (sent_end && field_tokens >= cot.field_tokens));
+                const bool capped = (sent_end && phase_tokens >= cap) || phase_tokens >= cap * 2;
+                const bool ask_done = phase == Phase::ANSWER && kind == Kind::ASK && phase_tokens >= 4 &&
+                                      piece.find('?') != std::string::npos;   // a question asked: stop there
+                if (capped && !degraded) why = "length cap";
+                if (ask_done) why = "question complete";
+                const bool force = capped || degraded;
+
+                auto enter_next = [&]() {
+                    // The model now writes ITS OWN next step. The opener only biases it toward variety.
+                    // Right after serving the user the openers lean toward checking in with them.
+                    next_opener = cotx::pick_opener((unsigned)rng(), awaiting ? cotx::OpenerMode::Waiting
+                                                   : (kind == Kind::USER && spoke && cycles_since_ask >= cot.ask_gap && (int)(rng() % 100) < cot.ask_after_user_percent
+                                                      ? cotx::OpenerMode::AfterUser : cotx::OpenerMode::General));
+                    inject("\n<next>\n" + next_opener);
+                    phase = Phase::NEXT; phase_tokens = 0; next_text.clear();
+                    emit("\n<next>\n" + next_opener);
+                };
+
+                if (phase == Phase::THINK && deciding && field_tokens >= 1) {
+                    // The model just chose. yes -> open <answer>.  no -> no answer at all: close the think block
+                    // and go straight to its own <next> line, i.e. it stays in thought.
+                    deciding = false;
+                    const bool speak = cotx::says_yes(piece);
+                    flush_out();
+                    if (speak) {
+                        spoke = true;
+                        phase = Phase::ANSWER; phase_tokens = 0;
+                        const std::string txt = "\n</think>\n<answer>\n";
+                        inject(txt);
+                        emit(txt);
+                        if (kind == Kind::ASK)        emit("[ASK] ");
+                        else if (kind == Kind::USER)  emit("[REPLY] ");
+                    } else {
+                        if (kind == Kind::USER) ask_cooldown = cot.quiet_cycles;   // closure: don't start asking again right away
+                        inject("\n</think>");
+                        emit("\n</think>");
+                        std::cerr << "[Idle][cot] staying in thought (" << (force_quiet ? quiet_why : std::string("its own choice")) << ")\n";
+                        enter_next();
+                    }
+                } else if (phase == Phase::THINK && !t_closed && !t_answered && !force && field_step) {
+                    // A think field finished: inject the next label, or close the think block after the last one.
+                    const bool had_nl = piece.find('\n') != std::string::npos;
+                    flush_out();
+                    if (think_field + 1 < think_labels.size()) {
+                        ++think_field; field_tokens = 0;
+                        const std::string lbl = (had_nl ? "" : "\n") + think_labels[think_field];
+                        inject(lbl);
+                        emit(lbl);
+                    } else {
+                        // Text fields done: the model now chooses between speaking and staying in thought.
+                        deciding = true; field_tokens = 0;
+                        // Pacing, like a person: don't talk over a question you are waiting on, don't talk again right
+                        // after speaking, and don't re-explain what you already covered (unless correcting yourself).
+                        force_quiet = false; quiet_why.clear();
+                        if (kind == Kind::NORMAL && !override_repeat && !event_cycle) {
+                            if (awaiting)                                         { force_quiet = true; quiet_why = "waiting for the user's reply"; }
+                            else if (speak_cooldown > 0)                          { force_quiet = true; quiet_why = "it just spoke"; }
+                            else if (ask_suppressed)                              { force_quiet = true; quiet_why = "not checking in again so soon"; }
+                            else if (cotx::repeats_topic(task_text, covered))     { force_quiet = true; quiet_why = "already explained that"; }
+                        }
+                        const std::string lbl = std::string(had_nl ? "" : "\n") + "Reply:";
+                        inject(lbl);
+                        emit(lbl);
+                    }
+                } else if (phase == Phase::THINK && (t_closed || t_answered || force)) {
+                    bool rewound = false;
+                    if (!t_closed && !t_answered && degraded) rewound = try_rewind();
+                    if (!rewound) flush_out();
+                    deciding = false; spoke = true;
+                    phase = Phase::ANSWER; phase_tokens = 0;
+                    if (t_answered) {
+                        tail.clear();                                   // model opened <answer> itself
+                    } else {
+                        const std::string txt = t_closed ? "\n<answer>\n" : "\n</think>\n<answer>\n";
+                        inject(txt);
+                        emit(txt);
+                    }
+                    if (kind == Kind::ASK)        emit("[ASK] ");
+                    else if (kind == Kind::USER)  emit("[REPLY] ");
+                    if (force && !t_closed && !t_answered)
+                        std::cerr << "[Idle][cot] think closed by runtime (" << why << (rewound ? ", rewound" : "") << ")\n";
+                } else if (phase == Phase::ANSWER && (a_closed || a_thinks || force || ask_done)) {
+                    bool rewound = false;
+                    if (!a_closed && !a_thinks && degraded) rewound = try_rewind();
+                    if (!rewound) flush_out();
+                    if (!a_closed && !a_thinks) {
+                        inject("\n</answer>");
+                        emit("\n</answer>");
+                        std::cerr << "[Idle][cot] answer closed by runtime (" << why << (rewound ? ", rewound" : "") << ")\n";
+                    }
+                    flush_out();
+                    speak_cooldown = cot.speak_gap;                     // having spoken, it now lets that land
+                    if (kind != Kind::ASK) {                            // remember what was covered so it is not explained twice
+                        covered.push_back(cotx::clean_note(task_text, 120));
+                        if (covered.size() > 16) covered.erase(covered.begin());
+                    }
+                    if (kind == Kind::ASK) {                            // the answer WAS the question: now we wait for the reply
+                        std::string q = answer_text;
+                        const size_t e = q.find("</answer>");
+                        if (e != std::string::npos) q.resize(e);
+                        pending_question = cotx::clean_note(q);
+                        awaiting = true;
+                        asked_at = std::chrono::steady_clock::now();
+                        std::cerr << "[Idle][cot] question sent; thinking continues while waiting for the user\n";
+                    }
+                    if (a_thinks) {
+                        phase = Phase::THINK; phase_tokens = 0; think_field = 0; field_tokens = 0; deciding = false; kind = Kind::NORMAL; tail.clear();
+                    } else {
+                        enter_next();
+                    }
+                } else if (phase == Phase::NEXT && (n_closed || force || next_end)) {
+                    flush_out();
+                    const bool had_nl = piece.find('\n') != std::string::npos;
+                    if (!n_closed) {
+                        const std::string c = std::string(had_nl ? "" : "\n") + "</next>";
+                        inject(c);
+                        emit(c);
+                    }
+                    last_note = cotx::clean_note(next_opener + next_text);
+                    begin_next_cycle(/*first=*/false);
+                    flush_out();
+                }
+            }
+        } else if (steer_enabled) {
+            // ---- non-CoT steering (v2): new user turn on EOS / length cap, rewind on run-on / loop
+            bool need_steer = false, degraded = false;
+            const char* why = "";
+            if (eos_this_step)                                         { need_steer = true; why = "EOS"; }
+            else if (sent_end && turn_tokens >= anti_repeat.turn_tokens){ need_steer = true; why = "turn cap"; }
+            else if (since_sent_end >= anti_repeat.max_runon)          { need_steer = degraded = true; why = "run-on"; }
+            else if (looks_like_loop(st.cached_tokens, keep))          { need_steer = degraded = true; why = "loop"; }
+
+            if (need_steer) {
+                bool rewound = false;
+                if (degraded) rewound = try_rewind();
+                if (!rewound) flush_out();
+                std::cout << "\n" << std::flush;
+
+                std::string steer = std::string(eos_this_step ? "" : "<|im_end|>") +
+                                    "\n<|im_start|>user\n" + make_steer(steer_idx++, steer_topic) +
+                                    "<|im_end|>\n<|im_start|>assistant\n";
+                inject(steer);
+                turn_tokens = 0;
+                std::cerr << "[Idle][steer] " << why << (rewound ? " (rewound to last sentence)" : "") << " -> new user turn\n";
+            }
+        }
+
+        next = sample_next();
     }
 
+    if (!pending_out.empty()) std::cout << pending_out;
     std::cout << tok.flush() << std::flush;
     idle_disk.flush();   // don't lose a partial buffer on clean shutdown
     std::cerr << "\n[Idle] stopped after " << produced << " tokens (max_tokens reached). "
@@ -1409,6 +2137,10 @@ struct IdleLoopArgs {
     std::string          zram_index_path     = "nectar_zram_index.jsonl";
     size_t               summary_max_tokens  = 40;
     double               zram_max_keep_fraction = 0.5;
+    AntiRepeat           anti_repeat;
+    bool                 steer = false;
+    std::string          steer_topic;
+    CotConfig            cot;
 };
 
 template <typename Loader>
@@ -1453,6 +2185,12 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
     Tokenizer tok(model.tok_meta);
     std::cerr << "[Tokenizer] vocab=" << model.tok_meta.tokens.size()
               << " bos=" << tok.bos_id << " eos=" << tok.eos_id << "\n";
+    {   // matters for any caller that builds ChatML text: encode(add_bos=true) already prepends BOS
+        auto im = tok.vocab_map.find("<|im_start|>");
+        std::cerr << "[Tokenizer] BOS " << ((im != tok.vocab_map.end() && im->second == tok.bos_id) ? "IS" : "is NOT")
+                  << " <|im_start|>  (so ChatML prompt text should " << ((im != tok.vocab_map.end() && im->second == tok.bos_id) ? "NOT" : "")
+                  << " start with <|im_start|> itself)\n";
+    }
 
     // ── Persistent interactive mode (spawned by NEON.py on boot) ──────────
     if (interactive) {
@@ -1471,7 +2209,8 @@ static int run_model(const std::string& model_path, engine::Config& cfg,
                       idle.disk_path, idle.disk_flush_every_tokens, idle.disk_flush_interval_s,
                       idle.vision_enabled, idle.vision_poll_ms,
                       idle.compression_kind, idle.chunk_tokens, idle.zram_ring_capacity,
-                      idle.zram_index_path, idle.summary_max_tokens, idle.zram_max_keep_fraction);
+                      idle.zram_index_path, idle.summary_max_tokens, idle.zram_max_keep_fraction,
+                      idle.anti_repeat, idle.steer, idle.steer_topic, idle.cot);
         return 0;
 #else
         std::cerr << "[Mode] Idle loop requested, but this build was compiled without "
@@ -1533,6 +2272,36 @@ int main(int argc, char* argv[]) {
                      "   --idle-log-every <N>           log cache/disk stats every N tokens (default 50)\n"
                      "   --idle-temperature <f>         sampling temperature (default 0.9)\n"
                      "   --idle-top-p <f>               nucleus sampling top-p (default 0.95)\n"
+                     "   --idle-rep-penalty <f>         repetition penalty over recent window, 1.0=off (default 1.15)\n"
+                     "   --idle-freq-penalty <f>        per-occurrence logit penalty (default 0.02)\n"
+                     "   --idle-rep-window <N>          tokens the penalties look back over (default 256)\n"
+                     "   --idle-no-repeat-ngram <N>     never complete an n-gram already seen, 0=off (default 4)\n"
+                     "   --idle-steer                   manage turns: new ChatML user turn on EOS/length cap, rewind+steer on run-on/loop\n"
+                     "   --idle-cot                     standby CoT: <think>..</think><answer>..</answer><next>..</next>; the model writes its own next step each cycle, can ask the user and keeps thinking while waiting (builds its own seed if none given)\n"
+                     "   --idle-lore <file>             one stimulus per line (character lore, goals, notes) mixed into the CoT stimuli\n"
+                     "   --idle-ask-timeout <S>         stop waiting for a user reply after S seconds (default 120)\n"
+                     "   --idle-lore-percent <N>        chance (%) a cycle opens with a lore line instead of the model's own next step (default 15)\n"
+                     "   --idle-next-tokens <N>         soft cap for the model's own what-next line (default 30)\n"
+                     "   --idle-think-tokens <N>        soft cap for the whole think block (default 100)\n"
+                     "   --idle-answer-tokens <N>       soft cap per idle answer, doubled when answering the user (default 120)\n"
+                     "   --idle-task <text>             prompt to follow first (answered via think/answer), then developed before standby drift\n"
+                     "   --idle-min-think <N>           tokens each think field needs before it may end (default 4)\n"
+                     "   --idle-hide-think              don't print <think> text (still kept in context and disk log)\n"
+                     "   --idle-input-file <path>       also read user messages from lines appended to this file (e.g. echo \"hi\" >> path from another shell)\n"
+                     "   --idle-speak-bias <f>          logit added to Reply:yes on idle cycles; negative = lean toward staying in thought (default -1.0)\n"
+                     "   --idle-user-speak-bias <f>     same when answering a user message (default 0.5)\n"
+                     "   --idle-quiet-cycles <N>        after it stays silent on a user message, no new questions for N cycles (default 8)\n"
+                     "   --idle-speak-gap <N>           cycles it stays quiet after speaking, and it never re-explains a covered topic (default 5)\n"
+                     "   --idle-ask-gap <N>             minimum cycles between questions to the user (default 10)\n"
+                     "   --idle-ask-after-user <N>      chance (%) that finishing a reply to the user leads it to consider checking in (default 25)\n"
+                     "   --idle-system-file <path>      replace the built-in system prompt with this file (built-in seed only; not used with --idle-seed)\n"
+                     "   --idle-input-line              pinned input line on the bottom terminal row: you always see what you type, model output scrolls above\n"
+                     "   --idle-no-echo                 turn off terminal input echo so typed text does not land inside the output (restored on exit / Ctrl-C)\n"
+                     "   --idle-no-user-input           don't read stdin lines as user interrupts\n"
+                     "   --idle-topic <text>            subject the steering prompts keep returning to (e.g. \"the United Nations\")\n"
+                     "   --idle-min-p <f>               min-p filter, 0=off (default 0.05)\n"
+                     "   --idle-turn-tokens <N>         soft cap on tokens per assistant turn (default 200)\n"
+                     "   --idle-max-runon <N>           tokens without sentence end before rewind (default 60)\n"
                      "   --idle-disk-path <path>        JSONL file evicted idle text is appended to (default nectar_idle_memory.jsonl)\n"
                      "   --idle-disk-flush-tokens <N>   flush to disk after N buffered tokens (default 300)\n"
                      "   --idle-disk-flush-seconds <N>  or after N seconds, whichever comes first (default 30)\n"
@@ -1554,6 +2323,8 @@ int main(int argc, char* argv[]) {
     int  threads_override = 0;   // 0 = auto-detect from hardware_concurrency()
     IdleLoopArgs idle;
     std::string idle_seed_file;
+    std::string idle_lore_file;
+    std::string idle_system_file;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1570,6 +2341,36 @@ int main(int argc, char* argv[]) {
         else if (arg == "--idle-log-every"        && i + 1 < argc) idle.log_every   = (size_t)std::max(0, std::atoi(argv[++i]));
         else if (arg == "--idle-temperature"      && i + 1 < argc) idle.temperature = std::strtof(argv[++i], nullptr);
         else if (arg == "--idle-top-p"            && i + 1 < argc) idle.top_p       = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-rep-penalty"      && i + 1 < argc) idle.anti_repeat.rep_penalty     = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-freq-penalty"     && i + 1 < argc) idle.anti_repeat.freq_penalty    = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-rep-window"       && i + 1 < argc) idle.anti_repeat.window          = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-no-repeat-ngram"  && i + 1 < argc) idle.anti_repeat.no_repeat_ngram = (int)std::strtol(argv[++i], nullptr, 10);
+        else if (arg == "--idle-steer")                            idle.steer = true;
+        else if (arg == "--idle-topic"            && i + 1 < argc) idle.steer_topic = argv[++i];
+        else if (arg == "--idle-cot")                              idle.cot.enabled = true;
+        else if (arg == "--idle-lore"             && i + 1 < argc) idle_lore_file = argv[++i];
+        else if (arg == "--idle-ask-timeout"      && i + 1 < argc) idle.cot.ask_timeout_s = std::atol(argv[++i]);
+        else if (arg == "--idle-lore-percent"     && i + 1 < argc) idle.cot.lore_percent  = std::atoi(argv[++i]);
+        else if (arg == "--idle-next-tokens"      && i + 1 < argc) idle.cot.next_tokens   = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-think-tokens"     && i + 1 < argc) idle.cot.think_tokens  = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-answer-tokens"    && i + 1 < argc) idle.cot.answer_tokens = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-hide-think")                       idle.cot.hide_think = true;
+        else if (arg == "--idle-task"             && i + 1 < argc) idle.cot.task = argv[++i];
+        else if (arg == "--idle-min-think"        && i + 1 < argc) idle.cot.min_think_tokens = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-no-user-input")                    idle.cot.user_input = false;
+        else if (arg == "--idle-no-echo")                          idle.cot.no_echo = true;
+        else if (arg == "--idle-input-line")                       idle.cot.input_line = true;
+        else if (arg == "--idle-system-file"      && i + 1 < argc) idle_system_file = argv[++i];
+        else if (arg == "--idle-ask-gap"          && i + 1 < argc) idle.cot.ask_gap = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-ask-after-user"   && i + 1 < argc) idle.cot.ask_after_user_percent = std::atoi(argv[++i]);
+        else if (arg == "--idle-speak-gap"        && i + 1 < argc) idle.cot.speak_gap = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-speak-bias"       && i + 1 < argc) idle.cot.speak_bias = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-user-speak-bias"  && i + 1 < argc) idle.cot.user_speak_bias = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-quiet-cycles"     && i + 1 < argc) idle.cot.quiet_cycles = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-input-file"       && i + 1 < argc) idle.cot.input_file = argv[++i];
+        else if (arg == "--idle-min-p"            && i + 1 < argc) idle.anti_repeat.min_p      = std::strtof(argv[++i], nullptr);
+        else if (arg == "--idle-turn-tokens"      && i + 1 < argc) idle.anti_repeat.turn_tokens = (size_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (arg == "--idle-max-runon"        && i + 1 < argc) idle.anti_repeat.max_runon   = (size_t)std::strtoul(argv[++i], nullptr, 10);
         else if (arg == "--idle-disk-path"        && i + 1 < argc) idle.disk_path   = argv[++i];
         else if (arg == "--idle-disk-flush-tokens" && i + 1 < argc) idle.disk_flush_every_tokens = (size_t)std::max(0, std::atoi(argv[++i]));
         else if (arg == "--idle-disk-flush-seconds"&& i + 1 < argc) idle.disk_flush_interval_s   = std::atol(argv[++i]);
@@ -1605,8 +2406,28 @@ int main(int argc, char* argv[]) {
         idle.seed_text = content;
     }
 
-    if (idle.enabled && idle.seed_text.empty()) {
-        std::cerr << "[Error] --idle-loop requires --idle-seed <text> or --idle-seed-file <path>.\n";
+    if (idle.enabled && idle.cot.enabled) {
+        idle.cot.default_seed = idle.seed_text.empty();
+        if (!idle_system_file.empty()) {                    // the system prompt as DATA: edit the file, no recompile
+            std::ifstream sf(idle_system_file, std::ios::binary);
+            if (!sf) { std::cerr << "[Error] --idle-system-file: cannot open " << idle_system_file << "\n"; return 1; }
+            idle.cot.system_text.assign((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
+            std::cerr << "[Idle][cot] system prompt loaded from " << idle_system_file << " (" << idle.cot.system_text.size() << " bytes)\n";
+        }   // no seed given -> use the built-in CoT system prompt
+        if (!idle_lore_file.empty()) {
+            std::ifstream lf(idle_lore_file);
+            if (!lf) { std::cerr << "[Error] --idle-lore: cannot open " << idle_lore_file << "\n"; return 1; }
+            std::string ln;
+            while (std::getline(lf, ln)) {
+                while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+                if (!ln.empty()) idle.cot.stimuli.push_back(ln);
+            }
+        }
+        idle.cot.n_lore = idle.cot.stimuli.size();            // [0, n_lore) = lore; defaults follow as fallbacks
+        for (auto& d : default_stimuli()) idle.cot.stimuli.push_back(d);
+    }
+    if (idle.enabled && idle.seed_text.empty() && !idle.cot.enabled) {
+        std::cerr << "[Error] --idle-loop requires --idle-seed <text> or --idle-seed-file <path> (or --idle-cot for the built-in CoT seed).\n";
         return 1;
     }
 
