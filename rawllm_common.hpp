@@ -89,7 +89,10 @@ RAWLLM_ALWAYS_INLINE static float fast_expf(float x) noexcept {
 #if defined(__HIP_DEVICE_COMPILE__)
     return __expf(x);
 #else
-    if (__builtin_expect(x < -88.f || x > 88.f, 0)) return std::exp(x);
+    // The Schraudolph integer trick needs kA*x + kB > 0, i.e. x > -kB/kA = -87.99. With the old cutoff of -88 the window
+    // x in (-88, -87.99) produced a NEGATIVE integer, whose bits are a NaN. That one NaN poisons the softmax sum, so the
+    // sampler returns junk tokens. It only shows up at low temperature (logit gaps / 0.2 reach -88); at 0.7 it never does.
+    if (__builtin_expect(x < -80.f || x > 88.f, 0)) return std::exp(x);
     // Schraudolph approximation:  2^(x/ln2) via integer add on FP32 bits.
     static constexpr float kA = 12102203.9f;   // (1 << 23) / ln2
     static constexpr float kB = 1064872507.f;  // 127 * (1 << 23) - 0.5 * kA * ln2  (bias)
