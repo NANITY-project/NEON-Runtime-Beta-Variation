@@ -10,7 +10,7 @@ spec itself — is designed around that one fixed shape on purpose. See
 [`NANITY_ARCHITECTURE_SPEC.md`](./NANITY_ARCHITECTURE_SPEC.md) for the
 full "why" and the exact tensor/metadata contract.
 
-> **Status: beta, source-available ** See
+> **Status: beta ** See
 > [`LICENSE`](./LICENSE) for current terms during the prototyping phase.
 
 ## What's actually working right now
@@ -313,7 +313,4 @@ the `VULKAN-EXPERIMENTAL` branch — see [Build](#build) above.)
 | `LICENSE` | Source-available license — current terms during the prototyping phase |
 | `nanity.html` | Project website |
 
-## License
 
-Source-available, - see [`LICENSE`](./LICENSE) for exactly what's currently permitted
-(download, local compile, testing, bug reports).
