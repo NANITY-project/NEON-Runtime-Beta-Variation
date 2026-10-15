@@ -434,6 +434,153 @@ inline void dot4_q8_0_q8_0(const uint8_t* w0, const uint8_t* w1, const uint8_t* 
 }
 
 // ── self-test (opt-in) ───────────────────────────────────────────────────────
+// ───────────────────── register-tiled prefill kernels ───────────────────────
+// PREVIOUSLY every weight row was re-read from L2/L3/DRAM once PER PROMPT
+// POSITION (loop order: position outer, row inner), and the "multi" path
+// used single-row dots with a per-block horizontal reduction. For a 256-token
+// prefill that is 256 full passes over each thread's weight slice -- which is
+// why prefill sat at ~0.2x of llama.cpp while decode (one pass) was close.
+//
+// tile4_*: computes a 4(rows) x npos(positions) block of outputs in one call.
+// Each weight block is loaded + unpacked ONCE and reused for P=2 positions;
+// the int32 block sums stay in vector lanes (converted to float and FMA'd
+// with wd*xd), and the horizontal reduction happens once per output at the
+// very end instead of once per 32-element block.
+//   out[t*out_stride + r] for r in [0,4), t in [0,npos). No bias (caller adds).
+//   w points at row 0; rows are row_bytes apart. x_* point at position 0 and
+//   are laid out as quantize_rows_q8_0() produces them (x_d/x_sum: nb per
+//   position, x_q: cols per position).
+#ifndef TILE_R
+#define TILE_R 4
+#endif
+#ifndef TILE_P
+#define TILE_P 2
+#endif
+namespace tile_detail {
+
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline float load_f16(const uint8_t* p) {
+    uint16_t h; std::memcpy(&h, p, 2);
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+}
+
+template <int R, int P>
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline void q4_tile(const uint8_t* w, size_t rb, const float* x_d,
+                    const int8_t* x_q, size_t cols, float* out, size_t os) {
+    const size_t nb = cols / 32;
+    __m256 acc[R][P];
+    for (int r = 0; r < R; ++r) for (int p = 0; p < P; ++p) acc[r][p] = _mm256_setzero_ps();
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    const __m256i eight = _mm256_set1_epi8(8);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (size_t b = 0; b < nb; ++b) {
+        __m256i xv[P]; __m256 xd[P];
+        for (int p = 0; p < P; ++p) {
+            xv[p] = _mm256_loadu_si256((const __m256i*)(x_q + p * cols + b * 32));
+            xd[p] = _mm256_broadcast_ss(x_d + p * nb + b);
+        }
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* blk = w + r * rb + b * 18;
+            uint16_t h; std::memcpy(&h, blk, 2);
+            __m256 wd = _mm256_cvtph_ps(_mm_set1_epi16((short)h));   // lane-broadcast scale
+            __m128i raw = _mm_loadu_si128((const __m128i*)(blk + 2));
+            __m128i lo = _mm_and_si128(raw, mask);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask);
+            // centered weights in [-8,7]: removes the per-block "-8*sum(x)" correction
+            __m256i wc = _mm256_sub_epi8(_mm256_set_m128i(hi, lo), eight);
+            __m256i aw = _mm256_sign_epi8(wc, wc);
+            for (int p = 0; p < P; ++p) {
+                __m256i sx  = _mm256_sign_epi8(xv[p], wc);
+                __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sx), ones);
+                acc[r][p] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), _mm256_mul_ps(wd, xd[p]), acc[r][p]);
+            }
+        }
+    }
+    for (int r = 0; r < R; ++r) for (int p = 0; p < P; ++p)
+        out[p * os + r] = hsum256(acc[r][p]);
+}
+
+template <int R, int P>
+__attribute__((target("avx2,fma,f16c"), always_inline))
+inline void q8_tile(const uint8_t* w, size_t rb, const float* x_d,
+                    const int8_t* x_q, size_t cols, float* out, size_t os) {
+    const size_t nb = cols / 32;
+    __m256 acc[R][P];
+    for (int r = 0; r < R; ++r) for (int p = 0; p < P; ++p) acc[r][p] = _mm256_setzero_ps();
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (size_t b = 0; b < nb; ++b) {
+        __m256i xv[P]; float xd[P];
+        for (int p = 0; p < P; ++p) {
+            xv[p] = _mm256_loadu_si256((const __m256i*)(x_q + p * cols + b * 32));
+            xd[p] = x_d[p * nb + b];
+        }
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* blk = w + r * rb + b * 34;
+            float wd = load_f16(blk);
+            __m256i wv = _mm256_loadu_si256((const __m256i*)(blk + 2));
+            __m256i aw = _mm256_sign_epi8(wv, wv);           // |w| (unsigned operand)
+            for (int p = 0; p < P; ++p) {
+                // |w|*sign(x,w): exact; max pair sum 2*128*127 < 32767 (x clamped to +-127)
+                __m256i sx  = _mm256_sign_epi8(xv[p], wv);
+                __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sx), ones);
+                acc[r][p] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32),
+                                            _mm256_set1_ps(wd * xd[p]), acc[r][p]);
+            }
+        }
+    }
+    for (int r = 0; r < R; ++r) for (int p = 0; p < P; ++p)
+        out[p * os + r] = hsum256(acc[r][p]);
+}
+} // namespace tile_detail
+
+__attribute__((target("default")))
+inline void tile4_q4_0_q8_0(const uint8_t* w, size_t rb, const float* x_d, const int32_t* x_sum,
+                             const int8_t* x_q, size_t cols, size_t npos, float* out, size_t os) {
+    size_t nb = cols / 32;
+    for (size_t t = 0; t < npos; ++t)
+        for (int r = 0; r < 4; ++r)
+            out[t * os + r] = dot_q4_0_q8_0(w + r * rb, x_d + t * nb, x_sum + t * nb, x_q + t * cols, cols);
+}
+__attribute__((target("avx2,fma,f16c")))
+inline void tile4_q4_0_q8_0(const uint8_t* w, size_t rb, const float* x_d, const int32_t* x_sum,
+                             const int8_t* x_q, size_t cols, size_t npos, float* out, size_t os) {
+    size_t nb = cols / 32, t = 0;
+    (void)x_sum;
+    for (; t + TILE_P <= npos; t += TILE_P)
+        for (int r = 0; r < 4; r += TILE_R)
+            tile_detail::q4_tile<TILE_R, TILE_P>(w + r * rb, rb, x_d + t * nb, x_q + t * cols, cols, out + t * os + r, os);
+    for (; t < npos; ++t)
+        tile_detail::q4_tile<4, 1>(w, rb, x_d + t * nb, x_q + t * cols, cols, out + t * os, os);
+}
+__attribute__((target("default")))
+inline void tile4_q8_0_q8_0(const uint8_t* w, size_t rb, const float* x_d, const int32_t* x_sum,
+                             const int8_t* x_q, size_t cols, size_t npos, float* out, size_t os) {
+    size_t nb = cols / 32;
+    for (size_t t = 0; t < npos; ++t)
+        for (int r = 0; r < 4; ++r)
+            out[t * os + r] = dot_q8_0_q8_0(w + r * rb, x_d + t * nb, x_sum + t * nb, x_q + t * cols, cols);
+}
+__attribute__((target("avx2,fma,f16c")))
+inline void tile4_q8_0_q8_0(const uint8_t* w, size_t rb, const float* x_d, const int32_t* x_sum,
+                             const int8_t* x_q, size_t cols, size_t npos, float* out, size_t os) {
+    size_t nb = cols / 32, t = 0;
+    (void)x_sum;
+    for (; t + TILE_P <= npos; t += TILE_P)
+        for (int r = 0; r < 4; r += TILE_R)
+            tile_detail::q8_tile<TILE_R, TILE_P>(w + r * rb, rb, x_d + t * nb, x_q + t * cols, cols, out + t * os + r, os);
+    for (; t < npos; ++t)
+        tile_detail::q8_tile<4, 1>(w, rb, x_d + t * nb, x_q + t * cols, cols, out + t * os, os);
+}
+
 #if defined(RAWLLM_SIMD_SELFTEST)
 #include <random>
 #include <vector>
