@@ -521,30 +521,20 @@ inline void proj_gpu(const loader::TensorInfo& W, const float* X, size_t x_strid
 // real hot-path cost, not a rounding error.
 inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
                                 size_t seq, float* d_out, int8_t* q_out,
-                                int32_t* sum_out) {
+                                int32_t* sum_out, util::ThreadPool* pool = nullptr) {
     size_t nb = cols / 32;
-    for (size_t t = 0; t < seq; ++t) {
-        const float* x = X + t * x_stride;
-        float*  d_row = d_out + t * nb;
-        int8_t* q_row = q_out + t * cols;
-        int32_t* s_row = sum_out + t * nb;
-        for (size_t b = 0; b < nb; ++b) {
-            const float* xb = x + b * 32;
-            float amax = 0.f;
-            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xb[j]));
-            float d  = amax / 127.0f;
-            float id = d > 0.f ? 1.0f / d : 0.f;
-            d_row[b] = d;
-            int8_t* qb = q_row + b * 32;
-            int32_t sum = 0;
-            for (int j = 0; j < 32; ++j) {
-                int v = (int)std::lround(xb[j] * id);
-                qb[j] = (int8_t)std::clamp(v, -127, 127);
-                sum += qb[j];
-            }
-            s_row[b] = sum;
-        }
+    auto rows = [=](size_t t0, size_t t1) {
+        for (size_t t = t0; t < t1; ++t)
+            simd::quantize_row_q8_0(X + t * x_stride, cols, d_out + t * nb, q_out + t * cols, sum_out + t * nb);
+    };
+    int nth = pool ? std::max(1, pool->size()) : 1;
+    if (nth == 1 || seq < 8) { rows(0, seq); return; }
+    size_t chunk = (seq + (size_t)nth - 1) / (size_t)nth;
+    for (size_t t0 = 0; t0 < seq; t0 += chunk) {
+        size_t t1 = std::min(seq, t0 + chunk);
+        pool->submit([=] { rows(t0, t1); });
     }
+    pool->wait();
 }
 
 // ───────────────────────── SIMD numeric primitives ───────────────────────────
@@ -566,6 +556,8 @@ using simd::dot_q4_0_q8_0;
 using simd::dot_q8_0_q8_0;
 using simd::dot4_q4_0_q8_0;
 using simd::dot4_q8_0_q8_0;
+using simd::attn_wsum_i8;
+using simd::quantize_row_q8_0;
 using simd::tile4_q4_0_q8_0;
 using simd::tile4_q8_0_q8_0;
 
@@ -693,7 +685,7 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (q8_d.size() < seq * nb)   q8_d.resize(seq * nb);
         if (q8_q.size() < seq * cols) q8_q.resize(seq * cols);
         if (q8_sum.size() < seq * nb) q8_sum.resize(seq * nb);
-        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
+        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
     }
     const float*   q8_d_ptr   = q8_d.data();
     const int8_t*  q8_q_ptr   = q8_q.data();
@@ -865,7 +857,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         if (q8_d.size() < seq * nb)             q8_d.resize(seq * nb);
         if (q8_q.size() < seq * any_fast_cols)  q8_q.resize(seq * any_fast_cols);
         if (q8_sum.size() < seq * nb)           q8_sum.resize(seq * nb);
-        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
+        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
     }
     const float*   q8_d_ptr   = q8_d.data();
     const int8_t*  q8_q_ptr   = q8_q.data();
@@ -961,6 +953,37 @@ inline void rope_apply(float* vec, size_t n_heads_local, size_t head_dim, size_t
             v[2*i + 1] = x0 * s + x1 * c;
         }
     }
+}
+
+// Same rotation as rope_apply(), but with cos/sin precomputed per (position,
+// pair) — they depend only on position and pair index, not on head or layer,
+// so the old code recomputed each cos/sin n_heads * n_layer times.
+inline void rope_apply_tab(float* vec, size_t n_heads_local, size_t head_dim, size_t half,
+                            const float* cos_t, const float* sin_t)
+{
+    for (size_t h = 0; h < n_heads_local; ++h) {
+        float* v = vec + h * head_dim;
+        for (size_t i = 0; i < half; ++i) {
+            float c = cos_t[i], s = sin_t[i];
+            float x0 = v[2*i], x1 = v[2*i + 1];
+            v[2*i]     = x0 * c - x1 * s;
+            v[2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// Runs fn(begin, end) over [0, n) split across the pool; inline when the
+// range is too small to be worth a barrier.
+template <typename Fn>
+inline void parallel_range(util::ThreadPool& pool, size_t n, size_t min_per_task, Fn fn) {
+    int nth = std::max(1, pool.size());
+    if (nth == 1 || n < 2 * min_per_task) { fn((size_t)0, n); return; }
+    size_t chunk = std::max(min_per_task, (n + (size_t)nth - 1) / (size_t)nth);
+    for (size_t b = 0; b < n; b += chunk) {
+        size_t e = std::min(n, b + chunk);
+        pool.submit([=] { fn(b, e); });
+    }
+    pool.wait();
 }
 
 // Rotates an already-RoPE'd vector by a signed position DELTA, instead of
@@ -1432,6 +1455,15 @@ inline void transformer_forward(const engine::Config& cfg,
     // O(n_layer × seq × n_head × head_dim/2).
     const std::vector<float> rope_freqs = rope_make_freqs(head_dim, cfg.rope_base);
     const size_t rope_half = cfg.rope_dim_count ? (cfg.rope_dim_count / 2) : (head_dim / 2);
+    std::vector<float> rope_cos(seq * rope_half), rope_sin(seq * rope_half);
+    for (size_t t = 0; t < seq; ++t) {
+        float fpos = (float)(base_pos + t) / cfg.rope_scale;
+        for (size_t i = 0; i < rope_half; ++i) {
+            float theta = fpos * rope_freqs[i];
+            rope_cos[t * rope_half + i] = std::cos(theta);
+            rope_sin[t * rope_half + i] = std::sin(theta);
+        }
+    }
 
     // Hidden state, one row per NEW position: h[t*n_embd .. +n_embd).
     // Earlier positions never re-enter the residual stream here — their
@@ -1492,8 +1524,10 @@ inline void transformer_forward(const engine::Config& cfg,
 
         // ── attn_norm + RMSNorm ──────────────────────────────────────────
         dequant_full(*L.attn_norm, w_norm.data());
-        for (size_t t = 0; t < seq; ++t)
-            rms_norm(&h[t * n_embd], w_norm.data(), &normed[t * n_embd], n_embd, cfg.norm_eps);
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
         stage_mark(us_norm);
 
         // ── Q/K/V projections (always separate — no fused-QKV variant) ──
@@ -1511,8 +1545,8 @@ inline void transformer_forward(const engine::Config& cfg,
         // ── RoPE, using each token's ABSOLUTE position (base_pos + t) ──────
         // rope_freqs was computed once before this loop; no std::pow here.
         for (size_t t = 0; t < seq; ++t) {
-            rope_apply(&q[t * q_dim],  n_head,    head_dim, rope_half, base_pos + t, cfg.rope_scale, rope_freqs.data());
-            rope_apply(&k[t * kv_dim], n_kv_head, head_dim, rope_half, base_pos + t, cfg.rope_scale, rope_freqs.data());
+            rope_apply_tab(&q[t * q_dim],  n_head,    head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
+            rope_apply_tab(&k[t * kv_dim], n_kv_head, head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
         }
 
         // ── Write this layer's new K/V into the cache BEFORE attention ───
@@ -1532,46 +1566,49 @@ inline void transformer_forward(const engine::Config& cfg,
         // case) — flattening in the head dimension too is what lets a
         // single new token still use every available thread.
         {
+            // Units are (position, head) pairs, handed out DYNAMICALLY from an
+            // atomic counter, heaviest (latest position) first. The old static
+            // split gave the last thread the longest causal rows (~1.8x the
+            // average load at 6 threads), so everyone waited on it.
             const size_t total_units = seq * n_head;
             int nthreads = std::max(1, pool.size());
-            size_t chunk = (total_units + (size_t)nthreads - 1) / (size_t)nthreads;
-            bool any = false;
-            for (int ti = 0; ti < nthreads; ++ti) {
-                size_t u0 = (size_t)ti * chunk, u1 = std::min(total_units, u0 + chunk);
-                if (u0 >= u1) continue;
-                any = true;
-                pool.submit([&, u0, u1] {
-                    std::vector<float> scores(base_pos + seq);
-                    for (size_t u = u0; u < u1; ++u) {
-                        size_t t  = u / n_head;
-                        size_t hh = u % n_head;
-                        size_t abs_t = base_pos + t;
-                        size_t kvh   = hh / group;
-                        const float* qv  = &q[t * q_dim + hh * head_dim];
-                        size_t klen = abs_t + 1;   // causal: attend to [0, abs_t] inclusive
+            std::atomic<size_t> next_unit{0};
+            const size_t vstride = kv_dim;
+            auto attn_worker = [&] {
+                std::vector<float> scores(base_pos + seq), coeff(base_pos + seq);
+                for (;;) {
+                    size_t idx = next_unit.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= total_units) break;
+                    size_t t  = seq - 1 - idx / n_head;
+                    size_t hh = idx % n_head;
+                    size_t abs_t = base_pos + t;
+                    size_t kvh   = hh / group;
+                    const float* qv  = &q[t * q_dim + hh * head_dim];
+                    size_t klen = abs_t + 1;   // causal: attend to [0, abs_t] inclusive
 
-                        float maxs = -std::numeric_limits<float>::infinity();
-                        for (size_t s = 0; s < klen; ++s) {
-                            float dot = dot_f32(qv, cache.k_row(li, s) + kvh * head_dim, head_dim) * scale;
-                            scores[s] = dot;
-                            if (dot > maxs) maxs = dot;
-                        }
-                        float sum = 0.f;
-                        for (size_t s = 0; s < klen; ++s) { scores[s] = engine::fast_expf(scores[s] - maxs); sum += scores[s]; }
-                        float inv = 1.0f / sum;
-                        float* outp = &attn_out[t * q_dim + hh * head_dim];
-                        std::fill(outp, outp + head_dim, 0.f);
-                        for (size_t s = 0; s < klen; ++s) {
-                            // v_scale folded into the coefficient here so
-                            // axpy_i8 itself stays a plain int8-weighted
-                            // accumulate with no per-call scale lookup.
-                            float coeff = scores[s] * inv * cache.v_scale(li, s, kvh);
-                            axpy_i8(outp, coeff, cache.v_row_q(li, s) + kvh * head_dim, head_dim);
-                        }
+                    float maxs = -std::numeric_limits<float>::infinity();
+                    for (size_t s2 = 0; s2 < klen; ++s2) {
+                        float dot = dot_f32(qv, cache.k_row(li, s2) + kvh * head_dim, head_dim) * scale;
+                        scores[s2] = dot;
+                        if (dot > maxs) maxs = dot;
                     }
-                });
+                    float sum = 0.f;
+                    for (size_t s2 = 0; s2 < klen; ++s2) { scores[s2] = engine::fast_expf(scores[s2] - maxs); sum += scores[s2]; }
+                    float inv = 1.0f / sum;
+                    // softmax weight and this position's int8 V scale folded into one coefficient
+                    for (size_t s2 = 0; s2 < klen; ++s2)
+                        coeff[s2] = scores[s2] * inv * cache.v_scale(li, s2, kvh);
+                    attn_wsum_i8(&attn_out[t * q_dim + hh * head_dim], coeff.data(),
+                                 cache.v_row_q(li, 0) + kvh * head_dim, vstride, klen, head_dim);
+                }
+            };
+            size_t ntasks = std::min<size_t>((size_t)nthreads, total_units);
+            if (ntasks <= 1) {
+                attn_worker();
+            } else {
+                for (size_t ti = 0; ti < ntasks; ++ti) pool.submit(attn_worker);
+                pool.wait();
             }
-            if (any) pool.wait();
         }
         stage_mark(us_attn);
 
@@ -1583,8 +1620,10 @@ inline void transformer_forward(const engine::Config& cfg,
 
         // ── FFN: RMSNorm -> SwiGLU -> down-proj + residual ──────────────
         dequant_full(*L.ffn_norm, w_norm.data());
-        for (size_t t = 0; t < seq; ++t)
-            rms_norm(&h[t * n_embd], w_norm.data(), &ff_normed[t * n_embd], n_embd, cfg.norm_eps);
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &ff_normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
         stage_mark(us_norm);
 
         // ── FFN: gate + up projections ────────────────────────────────────
@@ -1607,11 +1646,15 @@ inline void transformer_forward(const engine::Config& cfg,
                 {L.ffn_gate, gate_buf.data(), n_ff, L.ffn_gate_bias},
                 {L.ffn_up,   up_buf.data(),   n_ff, L.ffn_up_bias},
             }, ff_normed.data(), n_embd, seq, pool);
-            for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
+            });
         } else {
             // Plain SiLU-FFN: no gate projection — silu applied directly to up.
             proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool, L.ffn_up_bias);
-            for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(up_buf[i]);
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(up_buf[i]);
+            });
         }
         stage_mark(us_proj);
 
