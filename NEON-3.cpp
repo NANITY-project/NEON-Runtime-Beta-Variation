@@ -1170,8 +1170,10 @@ struct CotConfig {
 
 static const char* kCotBuild = "cot-build 11 (pacing + visible input line + rare check-ins)";   // printed at startup so a stale binary is obvious
 
+#if defined(NANITY_ENABLE_IDLE_LOOP)
 // Events from outside the generation loop (typed lines, vision deltas, future tool results).
 static mstream::SpliceQueue g_splice;
+#endif // NANITY_ENABLE_IDLE_LOOP
 
 static std::vector<std::string> default_stimuli()
 {
@@ -1207,6 +1209,7 @@ static std::vector<std::string> default_stimuli()
 // when the tokenizer's BOS id already IS <|im_start|> (add_bos=true prepends
 // it), so the sequence never starts with two.
 // The built-in system prompt (the standby format). Replaceable with --idle-system-file.
+#if defined(NANITY_ENABLE_IDLE_LOOP)
 static std::string default_cot_system_text()
 {
     return std::string(
@@ -1245,6 +1248,7 @@ static std::string build_cot_seed(const Tokenizer& tok, const std::string& task,
                               system_override.empty() ? default_cot_system_text() : system_override,
                               task.empty() ? std::string("Standby mode. Pick something interesting to explain.") : task);
 }
+#endif // NANITY_ENABLE_IDLE_LOOP
 
 // =============================================================================
 // Idle loop (NECTAR idle-loop architecture v3, §8 build-order step 1):
