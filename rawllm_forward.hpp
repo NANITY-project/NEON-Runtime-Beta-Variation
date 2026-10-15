@@ -420,6 +420,7 @@ inline const rocm::DevBuf<float>* get_or_upload(const loader::TensorInfo& W,
     std::vector<float> host((size_t)rows * cols);
     int nthreads = std::max(1, pool.size());
     size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
+    row_chunk = (row_chunk + 3) & ~(size_t)3;   // keep 4-row tiles aligned per thread
     bool any = false;
     for (int ti = 0; ti < nthreads; ++ti) {
         size_t r0 = (size_t)ti * row_chunk, r1 = std::min(rows, r0 + row_chunk);
@@ -565,6 +566,8 @@ using simd::dot_q4_0_q8_0;
 using simd::dot_q8_0_q8_0;
 using simd::dot4_q4_0_q8_0;
 using simd::dot4_q8_0_q8_0;
+using simd::tile4_q4_0_q8_0;
+using simd::tile4_q8_0_q8_0;
 
 // ───────────────────────── matvec / projections ─────────────────────────────
 // GGUF/GGML store a 2-D weight tensor with shape = [cols, rows] where
@@ -582,6 +585,46 @@ using simd::dot4_q8_0_q8_0;
 // Q4_0 weights take a separate fast path (dot_q4_0_q8_0() above) that skips
 // the dequantize-to-rowbuf step entirely; every other quant type still goes
 // through dequantize_row()+dot_f32().
+
+// Cache-blocked fused Q4_0/Q8_0 projection of weight rows [r0,r1) against
+// `seq` pre-quantized activation positions. Positions are processed in
+// blocks sized so the block's int8 activations (~96 KB) stay resident in L2,
+// and for each position block every weight row group is streamed from memory
+// exactly ONCE (seq/PB passes over the weights instead of `seq` passes), with
+// a 4-row x 2-position register tile inside (tile4_*). Used by both
+// proj_all_positions() and proj_all_positions_multi().
+inline void proj_fast_rows(bool is_q4, const uint8_t* wbase, size_t row_bytes, size_t cols,
+                           size_t r0, size_t r1, size_t seq, float* Y, size_t y_stride,
+                           const float* bias, const float* q8_d, const int32_t* q8_sum,
+                           const int8_t* q8_q)
+{
+    const size_t nb = cols / 32;
+    size_t PB = std::clamp<size_t>((96 * 1024) / std::max<size_t>(cols, 1), 2, 64) & ~(size_t)1;
+    for (size_t pb = 0; pb < seq; pb += PB) {
+        size_t np = std::min(PB, seq - pb);
+        const float*   xd = q8_d + pb * nb;
+        const int32_t* xs = q8_sum + pb * nb;
+        const int8_t*  xq = q8_q + pb * cols;
+        float* Yp = Y + pb * y_stride;
+        size_t r = r0;
+        for (; r + 4 <= r1; r += 4) {
+            const uint8_t* w = wbase + r * row_bytes;
+            if (is_q4) tile4_q4_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            else       tile4_q8_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            if (bias)
+                for (size_t t = 0; t < np; ++t)
+                    for (int j = 0; j < 4; ++j) Yp[t * y_stride + r + j] += bias[r + j];
+        }
+        for (; r < r1; ++r) {
+            const uint8_t* row = wbase + r * row_bytes;
+            float b = bias ? bias[r] : 0.f;
+            for (size_t t = 0; t < np; ++t)
+                Yp[t * y_stride + r] = (is_q4
+                    ? dot_q4_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)
+                    : dot_q8_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)) + b;
+        }
+    }
+}
 
 inline void proj_all_positions(const loader::TensorInfo& W,
                                 const float* X, size_t x_stride,
@@ -680,62 +723,9 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         any = true;
         pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
                      use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr, bias] {
-            size_t nb = cols / 32;
-            if (use_q4_0_fast) {
-                for (size_t t = 0; t < seq; ++t) {
-                    const float*   xd = q8_d_ptr + t * nb;
-                    const int32_t* xs = q8_sum_ptr + t * nb;
-                    const int8_t*  xq = q8_q_ptr + t * cols;
-                    size_t r = r0;
-                    // Batch 4 output rows per call — see the dot4_*
-                    // functions' comment in rawllm_simd_dispatch.hpp for
-                    // why (shares the activation-block load across 4
-                    // independent accumulator chains instead of 4 separate
-                    // single-row calls each reloading it).
-                    for (; r + 4 <= r1; r += 4) {
-                        float out4[4];
-                        dot4_q4_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
-                                       W.data_ptr + (r + 1) * row_bytes,
-                                       W.data_ptr + (r + 2) * row_bytes,
-                                       W.data_ptr + (r + 3) * row_bytes,
-                                       xd, xs, xq, cols, out4);
-                        Y[t * y_stride + r + 0] = out4[0] + (bias ? bias[r + 0] : 0.f);
-                        Y[t * y_stride + r + 1] = out4[1] + (bias ? bias[r + 1] : 0.f);
-                        Y[t * y_stride + r + 2] = out4[2] + (bias ? bias[r + 2] : 0.f);
-                        Y[t * y_stride + r + 3] = out4[3] + (bias ? bias[r + 3] : 0.f);
-                    }
-                    for (; r < r1; ++r) {
-                        const uint8_t* row = W.data_ptr + r * row_bytes;
-                        float b = bias ? bias[r] : 0.f;
-                        Y[t * y_stride + r] = dot_q4_0_q8_0(row, xd, xs, xq, cols) + b;
-                    }
-                }
-                return;
-            }
-            if (use_q8_0_fast) {
-                for (size_t t = 0; t < seq; ++t) {
-                    const float*   xd = q8_d_ptr + t * nb;
-                    const int32_t* xs = q8_sum_ptr + t * nb;
-                    const int8_t*  xq = q8_q_ptr + t * cols;
-                    size_t r = r0;
-                    for (; r + 4 <= r1; r += 4) {
-                        float out4[4];
-                        dot4_q8_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
-                                       W.data_ptr + (r + 1) * row_bytes,
-                                       W.data_ptr + (r + 2) * row_bytes,
-                                       W.data_ptr + (r + 3) * row_bytes,
-                                       xd, xs, xq, cols, out4);
-                        Y[t * y_stride + r + 0] = out4[0] + (bias ? bias[r + 0] : 0.f);
-                        Y[t * y_stride + r + 1] = out4[1] + (bias ? bias[r + 1] : 0.f);
-                        Y[t * y_stride + r + 2] = out4[2] + (bias ? bias[r + 2] : 0.f);
-                        Y[t * y_stride + r + 3] = out4[3] + (bias ? bias[r + 3] : 0.f);
-                    }
-                    for (; r < r1; ++r) {
-                        const uint8_t* row = W.data_ptr + r * row_bytes;
-                        float b = bias ? bias[r] : 0.f;
-                        Y[t * y_stride + r] = dot_q8_0_q8_0(row, xd, xs, xq, cols) + b;
-                    }
-                }
+            if (use_q4_0_fast || use_q8_0_fast) {
+                proj_fast_rows(use_q4_0_fast, W.data_ptr, row_bytes, cols, r0, r1, seq,
+                               Y, y_stride, bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr);
                 return;
             }
             // FIX (perf): this used to be `std::vector<float> rowbuf(cols);`
@@ -883,6 +873,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
 
     int nthreads = std::max(1, pool.size());
     size_t chunk = (total + (size_t)nthreads - 1) / (size_t)nthreads;
+    chunk = (chunk + 3) & ~(size_t)3;           // keep 4-row tiles aligned per thread
     bool any = false;
     for (int ti = 0; ti < nthreads; ++ti) {
         size_t g0 = (size_t)ti * chunk, g1 = std::min(total, g0 + chunk);
@@ -895,18 +886,9 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                 size_t hi = std::min(g1, sp.r1_global);
                 if (lo >= hi) continue;
                 if (sp.fast != FastKind::None) {
-                    size_t nb = sp.cols / 32;
-                    for (size_t g = lo; g < hi; ++g) {
-                        size_t r = g - sp.r0_global;
-                        const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
-                        float b = sp.bias ? sp.bias[r] : 0.f;
-                        for (size_t t = 0; t < seq; ++t)
-                            sp.Y[t * sp.y_stride + r] = ((sp.fast == FastKind::Q4_0)
-                                ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols)
-                                : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols)) + b;
-                    }
+                    proj_fast_rows(sp.fast == FastKind::Q4_0, sp.W->data_ptr, sp.row_bytes, sp.cols,
+                                   lo - sp.r0_global, hi - sp.r0_global, seq, sp.Y, sp.y_stride,
+                                   sp.bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr);
                     continue;
                 }
                 if (rowbuf.size() < sp.cols) rowbuf.resize(sp.cols);
