@@ -581,6 +581,107 @@ inline void tile4_q8_0_q8_0(const uint8_t* w, size_t rb, const float* x_d, const
         tile_detail::q8_tile<4, 1>(w, rb, x_d + t * nb, x_q + t * cols, cols, out + t * os, os);
 }
 
+// ───────────────── attention / activation-quantization kernels ──────────────
+// attn_wsum_i8: out[d] = sum_s coeff[s] * (float)vq[s*vstride + d], d in [0,hd).
+// The AVX2 version keeps 64 output lanes in 8 registers across the whole
+// position loop (the old per-position axpy_i8 re-loaded and re-stored `out`
+// for every position).
+__attribute__((target("default")))
+inline void attn_wsum_i8(float* out, const float* coeff, const int8_t* vq, size_t vstride,
+                         size_t klen, size_t hd) {
+    for (size_t d = 0; d < hd; ++d) out[d] = 0.f;
+    for (size_t s = 0; s < klen; ++s) {
+        const int8_t* v = vq + s * vstride; float c = coeff[s];
+        for (size_t d = 0; d < hd; ++d) out[d] += c * (float)v[d];
+    }
+}
+__attribute__((target("avx2,fma")))
+inline void attn_wsum_i8(float* out, const float* coeff, const int8_t* vq, size_t vstride,
+                         size_t klen, size_t hd) {
+    size_t c0 = 0;
+    for (; c0 + 64 <= hd; c0 += 64) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        for (size_t s = 0; s < klen; ++s) {
+            const int8_t* v = vq + s * vstride + c0;
+            __m256 c = _mm256_set1_ps(coeff[s]);
+            a0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v +  0)))), c, a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v +  8)))), c, a1);
+            a2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 16)))), c, a2);
+            a3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 24)))), c, a3);
+            a4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 32)))), c, a4);
+            a5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 40)))), c, a5);
+            a6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 48)))), c, a6);
+            a7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(v + 56)))), c, a7);
+        }
+        _mm256_storeu_ps(out + c0 +  0, a0); _mm256_storeu_ps(out + c0 +  8, a1);
+        _mm256_storeu_ps(out + c0 + 16, a2); _mm256_storeu_ps(out + c0 + 24, a3);
+        _mm256_storeu_ps(out + c0 + 32, a4); _mm256_storeu_ps(out + c0 + 40, a5);
+        _mm256_storeu_ps(out + c0 + 48, a6); _mm256_storeu_ps(out + c0 + 56, a7);
+    }
+    if (c0 < hd) {   // head_dim not a multiple of 64: scalar tail columns
+        for (size_t d = c0; d < hd; ++d) out[d] = 0.f;
+        for (size_t s = 0; s < klen; ++s) {
+            const int8_t* v = vq + s * vstride; float c = coeff[s];
+            for (size_t d = c0; d < hd; ++d) out[d] += c * (float)v[d];
+        }
+    }
+}
+
+// quantize_row_q8_0: one activation row -> per-32-block {scale, int8[32], sum(int8)}.
+// Replaces the scalar loop that called std::lround per element. (Rounding is
+// round-to-nearest-even here vs. half-away-from-zero before; differs only on
+// exact .5 ties, <= 1 LSB of the int8 code.)
+__attribute__((target("default")))
+inline void quantize_row_q8_0(const float* x, size_t cols, float* d_out, int8_t* q_out, int32_t* s_out) {
+    size_t nb = cols / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0.f;
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xb[j]));
+        float d = amax / 127.0f, id = d > 0.f ? 1.0f / d : 0.f;
+        d_out[b] = d;
+        int8_t* qb = q_out + b * 32; int32_t sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            int v = (int)std::lround(xb[j] * id);
+            qb[j] = (int8_t)std::clamp(v, -127, 127); sum += qb[j];
+        }
+        s_out[b] = sum;
+    }
+}
+__attribute__((target("avx2,fma")))
+inline void quantize_row_q8_0(const float* x, size_t cols, float* d_out, int8_t* q_out, int32_t* s_out) {
+    size_t nb = cols / 32;
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
+    for (size_t b = 0; b < nb; ++b) {
+        const float* xb = x + b * 32;
+        __m256 v0 = _mm256_loadu_ps(xb), v1 = _mm256_loadu_ps(xb + 8), v2 = _mm256_loadu_ps(xb + 16), v3 = _mm256_loadu_ps(xb + 24);
+        __m256 m = _mm256_max_ps(_mm256_max_ps(_mm256_and_ps(v0, absmask), _mm256_and_ps(v1, absmask)),
+                                 _mm256_max_ps(_mm256_and_ps(v2, absmask), _mm256_and_ps(v3, absmask)));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        float amax = _mm_cvtss_f32(m4);
+        float d = amax / 127.0f, id = d > 0.f ? 1.0f / d : 0.f;
+        d_out[b] = d;
+        __m256 idv = _mm256_set1_ps(id);
+        __m256i i0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v0, idv)), lo), hi);
+        __m256i i1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v1, idv)), lo), hi);
+        __m256i i2 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v2, idv)), lo), hi);
+        __m256i i3 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v3, idv)), lo), hi);
+        __m256i sum8 = _mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3));
+        __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(sum8), _mm256_extracti128_si256(sum8, 1));
+        s4 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 1));
+        s_out[b] = _mm_cvtsi128_si32(s4);
+        // pack 4x8 int32 -> 32 int8 (lane order fixed by the final permute)
+        __m256i p01 = _mm256_packs_epi32(i0, i1), p23 = _mm256_packs_epi32(i2, i3);
+        __m256i p = _mm256_packs_epi16(p01, p23);
+        p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        _mm256_storeu_si256((__m256i*)(q_out + b * 32), p);
+    }
+}
+
 #if defined(RAWLLM_SIMD_SELFTEST)
 #include <random>
 #include <vector>
