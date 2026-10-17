@@ -9,8 +9,11 @@ shaders live):
 
 What it does, automatically:
   1. finds a shader compiler (glslangValidator or glslc), a C++ compiler and
-     the Vulkan headers/loader, and tells you the exact install command if
-     something is missing (--install-deps runs it for apt-based systems)
+     the Vulkan headers/loader, and INSTALLS whatever is missing: first via the
+     system package manager (apt/dnf/pacman/brew, using sudo -n if you are not
+     root), then, if that is impossible, by downloading a prebuilt glslang from
+     Khronos' GitHub release and the Vulkan-Headers sources into the build dir
+     (no root needed). Disable with --no-auto-install
   2. compiles EVERY *.comp in the repo to SPIR-V, trying several --target-env
      levels and both compilers, plus the INT8_STORAGE (_int8) and dp4a variants
      where the sources exist. Required vs optional shaders are tracked, and an
@@ -26,9 +29,9 @@ What it does, automatically:
   6. prints a table, writes vulkan_selftest_report.json, exit code 0 = all pass
 
 Useful flags:  --full  (bigger shapes)   --no-bench   --shaders-only
-               --lavapipe (force Mesa software Vulkan)   --install-deps
+               --lavapipe (force Mesa software Vulkan)   --no-auto-install
 """
-import argparse, json, os, platform, re, shutil, subprocess, sys, textwrap, time
+import argparse, io, json, os, platform, re, shutil, stat, subprocess, sys, tarfile, textwrap, time, urllib.request, zipfile
 from pathlib import Path
 
 REQUIRED_SHADERS = ["matvec_f32", "matvec_f32_scalar", "matvec_q4_0", "matvec_q8_0"]
@@ -49,6 +52,16 @@ INSTALL_HINTS = {
     "brew": "brew install glslang vulkan-headers vulkan-loader molten-vk",
     "win": "Install the LunarG Vulkan SDK (gives glslc, glslangValidator, headers, loader) and build under MSYS2/MinGW or WSL2.",
 }
+# what to install per missing component, per package manager
+PKGS = {
+    "apt":    {"shader": ["glslang-tools"], "vkdev": ["libvulkan-dev"], "cxx": ["build-essential"], "runtime": ["mesa-vulkan-drivers", "vulkan-tools"]},
+    "dnf":    {"shader": ["glslang"], "vkdev": ["vulkan-loader-devel", "vulkan-headers"], "cxx": ["gcc-c++"], "runtime": ["mesa-vulkan-drivers", "vulkan-tools"]},
+    "pacman": {"shader": ["glslang"], "vkdev": ["vulkan-headers", "vulkan-icd-loader"], "cxx": ["base-devel"], "runtime": ["vulkan-swrast", "vulkan-tools"]},
+    "brew":   {"shader": ["glslang"], "vkdev": ["vulkan-headers", "vulkan-loader"], "cxx": [], "runtime": ["molten-vk", "vulkan-tools"]},
+}
+GLSLANG_KEYS = {"Linux": "linux-x86_64", "Darwin": "macos-universal", "Windows": "windows-x86_64"}
+GLSLANG_BASE = "https://github.com/KhronosGroup/glslang/releases"
+VKHEADERS_URL = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/heads/main"
 
 
 def sh(cmd, **kw):
@@ -86,19 +99,194 @@ def banner(t):
 # --------------------------------------------------------------------------
 # toolchain discovery
 # --------------------------------------------------------------------------
-def discover(args):
-    tc = {}
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def pm_install(pm, pkgs):
+    """Install packages with the system package manager, non-interactively. Returns True on success."""
+    if not pkgs or pm not in PKGS:
+        return False
+    prefix = []
+    if pm != "brew" and not is_root():
+        if shutil.which("sudo") and sh(["sudo", "-n", "true"]).returncode == 0:
+            prefix = ["sudo", "-n"]
+        else:
+            print("  (not root and passwordless sudo unavailable; skipping package manager)")
+            return False
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    if pm == "apt":
+        sh(prefix + ["apt-get", "update", "-qq"], env=env)  # tolerate unrelated broken repos
+        cmd = prefix + ["apt-get", "install", "-y", "-qq"] + pkgs
+    elif pm == "dnf":
+        cmd = prefix + ["dnf", "install", "-y"] + pkgs
+    elif pm == "pacman":
+        cmd = prefix + ["pacman", "-S", "--needed", "--noconfirm"] + pkgs
+    else:
+        cmd = ["brew", "install"] + pkgs
+    print("  running:", " ".join(cmd))
+    r = sh(cmd, env=env)
+    if r.returncode != 0:
+        print("  install failed:", ((r.stderr or r.stdout).strip().splitlines() or ["?"])[-1][:150])
+    return r.returncode == 0
+
+
+def download(url, timeout=180):
+    req = urllib.request.Request(url, headers={"User-Agent": "neon-vulkan-selftest"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def fetch_glslang(build: Path):
+    """Download a prebuilt glslangValidator from Khronos' main-tot release into build/tools. No root needed."""
+    key = GLSLANG_KEYS.get(platform.system())
+    mach = platform.machine().lower()
+    if not key or (platform.system() == "Linux" and mach not in ("x86_64", "amd64")):
+        print(f"  no prebuilt glslang for {platform.system()}/{mach}")
+        return None
+    tools = build / "tools"
+    exe_name = "glslangValidator.exe" if platform.system() == "Windows" else "glslangValidator"
+    found = next(tools.rglob(exe_name), None) if tools.exists() else None
+    if not found:
+        asset = f"glslang-main-{key}-release.zip"
+        url = f"{GLSLANG_BASE}/download/main-tot/{asset}"
+        try:  # prefer the URL actually listed on the release page (asset names have changed before)
+            page = download(f"{GLSLANG_BASE}/expanded_assets/main-tot", 60).decode("utf-8", "replace")
+            m = re.search(r'href="([^"]*/main-tot/glslang-main-%s-release\.zip)"' % re.escape(key), page)
+            if m:
+                url = "https://github.com" + m.group(1)
+        except Exception:
+            pass
+        print("  downloading", url)
+        try:
+            data = download(url)
+        except Exception as e:
+            print("  download failed:", e)
+            return None
+        tools.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            z.extractall(tools)
+        found = next(tools.rglob(exe_name), None)
+        if not found:
+            print("  archive did not contain", exe_name)
+            return None
+    # zip extraction turns the release's glslangValidator -> glslang symlink into a tiny text file; resolve it
+    if found.stat().st_size < 256:
+        target = found.parent / found.read_text().strip()
+        if target.is_file():
+            shutil.copyfile(target, found)
+    if platform.system() != "Windows":
+        found.chmod(found.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    r = sh([str(found), "--version"])
+    if r.returncode != 0:
+        print("  downloaded glslangValidator won't run here:", (r.stderr or r.stdout).strip()[:120])
+        return None
+    return str(found)
+
+
+def fetch_vulkan_headers(build: Path):
+    """Download Vulkan-Headers sources (header-only) into build/tools. Returns the include dir or None."""
+    inc = build / "tools" / "Vulkan-Headers" / "include"
+    if (inc / "vulkan" / "vulkan.h").exists():
+        return str(inc)
+    print("  downloading", VKHEADERS_URL)
+    try:
+        data = download(VKHEADERS_URL)
+        dest = build / "tools" / "Vulkan-Headers"
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+            for mem in t.getmembers():
+                parts = mem.name.split("/", 1)
+                if len(parts) == 2 and parts[1].startswith("include/") and not mem.isdir():
+                    mem.name = parts[1]
+                    t.extract(mem, dest)
+    except Exception as e:
+        print("  download failed:", e)
+        return None
+    return str(inc) if (inc / "vulkan" / "vulkan.h").exists() else None
+
+
+def discover(args, build: Path):
+    tc = {"extra_inc": []}
     tc["glslang"] = args.glslang or which_any("glslangValidator")
     tc["glslc"] = which_any("glslc")
     tc["cxx"] = args.cxx or which_any("g++", "clang++", "c++")
+    tools = build / "tools"  # reuse earlier downloads
+    if tools.exists():
+        if not tc["glslang"]:
+            exe = "glslangValidator.exe" if platform.system() == "Windows" else "glslangValidator"
+            hit = next(tools.rglob(exe), None)
+            tc["glslang"] = str(hit) if hit else None
+        inc = tools / "Vulkan-Headers" / "include"
+        if (inc / "vulkan" / "vulkan.h").exists():
+            tc["extra_inc"].append(str(inc))
     return tc
 
 
-def check_vulkan_headers(cxx, tmp: Path):
+def check_vulkan_headers(cxx, tmp: Path, extra_inc=()):
     src = tmp / "_hdr_check.cpp"
     src.write_text("#include <vulkan/vulkan.h>\nint main(){VkInstance i=nullptr;(void)i;return 0;}\n")
-    r = sh([cxx, "-std=c++20", "-fsyntax-only", str(src)])
+    cmd = [cxx, "-std=c++20", "-fsyntax-only"] + [f"-I{d}" for d in extra_inc] + [str(src)]
+    r = sh(cmd)
     return r.returncode == 0, r.stderr
+
+
+def ensure_toolchain(args, build: Path):
+    """Find everything; install/download whatever is missing. Returns (toolchain, problems)."""
+    tc = discover(args, build)
+    pm = pkg_manager()
+    auto = not args.no_auto_install
+    problems = []
+
+    if not tc["cxx"] and not args.shaders_only:
+        print("C++ compiler missing.")
+        if auto and pm in PKGS and pm_install(pm, PKGS[pm]["cxx"]):
+            tc["cxx"] = args.cxx or which_any("g++", "clang++", "c++")
+        if not tc["cxx"]:
+            problems.append("no C++ compiler" + (" (macOS: run `xcode-select --install`)" if platform.system() == "Darwin" else ""))
+
+    if not (tc["glslang"] or tc["glslc"]):
+        print("Shader compiler missing.")
+        if auto:
+            if pm in PKGS and pm_install(pm, PKGS[pm]["shader"]):
+                tc["glslang"] = which_any("glslangValidator")
+                tc["glslc"] = which_any("glslc")
+            if not (tc["glslang"] or tc["glslc"]):
+                print("  falling back to a prebuilt glslang download")
+                tc["glslang"] = fetch_glslang(build)
+        if not (tc["glslang"] or tc["glslc"]):
+            problems.append("no shader compiler (glslangValidator/glslc) and auto-install failed" if auto else "no shader compiler (glslangValidator/glslc)")
+
+    if tc["cxx"] and not args.shaders_only:
+        ok, err = check_vulkan_headers(tc["cxx"], build, tc["extra_inc"])
+        if not ok:
+            print("Vulkan headers missing.")
+            if auto:
+                if pm in PKGS and pm_install(pm, PKGS[pm]["vkdev"]):
+                    ok, err = check_vulkan_headers(tc["cxx"], build, tc["extra_inc"])
+                if not ok:
+                    print("  falling back to downloading Vulkan-Headers sources")
+                    inc = fetch_vulkan_headers(build)
+                    if inc:
+                        tc["extra_inc"].append(inc)
+                        ok, err = check_vulkan_headers(tc["cxx"], build, tc["extra_inc"])
+            if not ok:
+                problems.append("Vulkan headers not found")
+        tc["headers_ok"] = ok
+    return tc, problems
+
+
+def ensure_vulkan_runtime(args):
+    """Make sure at least one Vulkan device (real GPU driver or lavapipe) is visible; install runtime pieces if not."""
+    devs = device_summary()
+    if devs or args.no_auto_install:
+        return devs
+    pm = pkg_manager()
+    if pm in PKGS:
+        print("No Vulkan device visible (or vulkaninfo missing); installing the Vulkan runtime/ICD packages.")
+        pm_install(pm, PKGS[pm]["runtime"])
+        devs = device_summary()
+    return devs
 
 
 def device_summary():
@@ -422,7 +610,7 @@ def build_harness(tc, repo: Path, build: Path, have_matmul: bool):
     cpp.write_text(HARNESS.replace("#include <vector>\nusing namespace", "#include <vector>\n#include <array>\nusing namespace", 1))
     exe = build / ("vk_selftest_harness.exe" if platform.system() == "Windows" else "vk_selftest_harness")
     cmd = [tc["cxx"], "-std=c++20", "-O2", "-pthread", "-DUSE_VULKAN", f"-DHAVE_MATMUL={1 if have_matmul else 0}",
-           "-I", str(build), "-I", str(repo), str(cpp), "-o", str(exe)]
+           "-I", str(build), "-I", str(repo)] + [f"-I{d}" for d in tc.get("extra_inc", [])] + [str(cpp), "-o", str(exe)]
     if platform.system() == "Darwin":
         cmd += ["-lvulkan"]
     else:
@@ -443,7 +631,8 @@ def main():
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--shaders-only", action="store_true", help="only compile shaders and report")
     ap.add_argument("--lavapipe", action="store_true", help="force Mesa lavapipe (CPU Vulkan) via VK_ICD_FILENAMES")
-    ap.add_argument("--install-deps", action="store_true", help="run the package install command (apt only)")
+    ap.add_argument("--no-auto-install", action="store_true", help="don't install/download missing tools; just report them")
+    ap.add_argument("--install-deps", action="store_true", help=argparse.SUPPRESS)  # legacy, now the default behaviour
     ap.add_argument("--report", default="vulkan_selftest_report.json")
     args = ap.parse_args()
 
@@ -452,23 +641,14 @@ def main():
     build.mkdir(parents=True, exist_ok=True)
 
     banner("environment")
-    if args.install_deps:
-        if pkg_manager() == "apt":
-            print("running:", INSTALL_HINTS["apt"])
-            subprocess.run(INSTALL_HINTS["apt"].replace("sudo ", "" if os.geteuid() == 0 else "sudo "), shell=True)
-        else:
-            print("--install-deps only automates apt. Run this yourself:\n  " + hint())
-    tc = discover(args)
+    tc, problems = ensure_toolchain(args, build)
     print("glslangValidator:", tc["glslang"] or "NOT FOUND")
     print("glslc           :", tc["glslc"] or "not found")
     print("C++ compiler    :", tc["cxx"] or "NOT FOUND")
-    problems = []
-    if not (tc["glslang"] or tc["glslc"]):
-        problems.append("no shader compiler (glslangValidator/glslc)")
-    if not tc["cxx"] and not args.shaders_only:
-        problems.append("no C++ compiler")
+    if tc["cxx"] and not args.shaders_only:
+        print("Vulkan headers  :", "ok" + (f" (downloaded to {tc['extra_inc'][-1]})" if tc["extra_inc"] else "") if tc.get("headers_ok") else "NOT FOUND")
     if problems:
-        print("\nMissing:", "; ".join(problems), "\nInstall with:\n  " + hint())
+        print("\nCould not set up:", "; ".join(problems), "\nInstall manually with:\n  " + hint())
         return 3
 
     if not (repo / "rawllm_vulkan.hpp").exists():
@@ -479,14 +659,8 @@ def main():
               "  git fetch origin VULKAN-EXPERIMENTAL && git checkout VULKAN-EXPERIMENTAL")
         return 3
 
-    if tc["cxx"] and not args.shaders_only:
-        ok, err = check_vulkan_headers(tc["cxx"], build)
-        print("Vulkan headers  :", "ok" if ok else "NOT FOUND")
-        if not ok:
-            print(err.strip().splitlines()[0] if err.strip() else "", "\nInstall with:\n  " + hint())
-            return 3
-    devs = device_summary()
-    print("Vulkan devices  :", ", ".join(d.strip() for d in devs) if devs else "(vulkaninfo not available or none found)")
+    devs = ensure_vulkan_runtime(args)
+    print("Vulkan devices  :", ", ".join(d.strip() for d in devs) if devs else "(none found: the backend will fail to construct)")
 
     if args.lavapipe:
         for p in ("/usr/share/vulkan/icd.d/lvp_icd.json", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"):
@@ -535,7 +709,8 @@ def main():
     ok, exe, log = build_harness(tc, repo, build, have_matmul and have("matmul_tiled_f32"))
     if not ok:
         print(log[-3000:])
-        print("\nBuild failed. If this is a missing -lvulkan, install the loader dev package:\n  " + hint())
+        print("\nBuild failed. If this is a missing -lvulkan, the Vulkan loader library is not installed;\n"
+              "headers can be downloaded but the loader needs a package:\n  " + hint())
         return 5
     print("built", exe.name)
 
