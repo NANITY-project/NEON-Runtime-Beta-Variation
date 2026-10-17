@@ -86,6 +86,7 @@
 #include "rawllm_loader.hpp"
 #include "rawllm_util.hpp"
 #include "rawllm_simd_dispatch.hpp"
+#include "rawllm_repack.hpp"   // 8-row interleaved Q4_0/Q8_0 panels + rows-in-lanes GEMM kernels
 #include <iostream>  // for the VERBOSE_LOG std::cerr line below
 #include <mutex>
 #include <unordered_map>
@@ -420,6 +421,7 @@ inline const rocm::DevBuf<float>* get_or_upload(const loader::TensorInfo& W,
     std::vector<float> host((size_t)rows * cols);
     int nthreads = std::max(1, pool.size());
     size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
+    row_chunk = (row_chunk + 3) & ~(size_t)3;   // keep 4-row tiles aligned per thread
     bool any = false;
     for (int ti = 0; ti < nthreads; ++ti) {
         size_t r0 = (size_t)ti * row_chunk, r1 = std::min(rows, r0 + row_chunk);
@@ -520,30 +522,20 @@ inline void proj_gpu(const loader::TensorInfo& W, const float* X, size_t x_strid
 // real hot-path cost, not a rounding error.
 inline void quantize_rows_q8_0(const float* X, size_t x_stride, size_t cols,
                                 size_t seq, float* d_out, int8_t* q_out,
-                                int32_t* sum_out) {
+                                int32_t* sum_out, util::ThreadPool* pool = nullptr) {
     size_t nb = cols / 32;
-    for (size_t t = 0; t < seq; ++t) {
-        const float* x = X + t * x_stride;
-        float*  d_row = d_out + t * nb;
-        int8_t* q_row = q_out + t * cols;
-        int32_t* s_row = sum_out + t * nb;
-        for (size_t b = 0; b < nb; ++b) {
-            const float* xb = x + b * 32;
-            float amax = 0.f;
-            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xb[j]));
-            float d  = amax / 127.0f;
-            float id = d > 0.f ? 1.0f / d : 0.f;
-            d_row[b] = d;
-            int8_t* qb = q_row + b * 32;
-            int32_t sum = 0;
-            for (int j = 0; j < 32; ++j) {
-                int v = (int)std::lround(xb[j] * id);
-                qb[j] = (int8_t)std::clamp(v, -127, 127);
-                sum += qb[j];
-            }
-            s_row[b] = sum;
-        }
+    auto rows = [=](size_t t0, size_t t1) {
+        for (size_t t = t0; t < t1; ++t)
+            simd::quantize_row_q8_0(X + t * x_stride, cols, d_out + t * nb, q_out + t * cols, sum_out + t * nb);
+    };
+    int nth = pool ? std::max(1, pool->size()) : 1;
+    if (nth == 1 || seq < 8) { rows(0, seq); return; }
+    size_t chunk = (seq + (size_t)nth - 1) / (size_t)nth;
+    for (size_t t0 = 0; t0 < seq; t0 += chunk) {
+        size_t t1 = std::min(seq, t0 + chunk);
+        pool->submit([=] { rows(t0, t1); });
     }
+    pool->wait();
 }
 
 // ───────────────────────── SIMD numeric primitives ───────────────────────────
@@ -565,6 +557,11 @@ using simd::dot_q4_0_q8_0;
 using simd::dot_q8_0_q8_0;
 using simd::dot4_q4_0_q8_0;
 using simd::dot4_q8_0_q8_0;
+using simd::attn_wsum_i8;
+using simd::attn_scores;
+using simd::quantize_row_q8_0;
+using simd::tile4_q4_0_q8_0;
+using simd::tile4_q8_0_q8_0;
 
 // ───────────────────────── matvec / projections ─────────────────────────────
 // GGUF/GGML store a 2-D weight tensor with shape = [cols, rows] where
@@ -582,6 +579,90 @@ using simd::dot4_q8_0_q8_0;
 // Q4_0 weights take a separate fast path (dot_q4_0_q8_0() above) that skips
 // the dequantize-to-rowbuf step entirely; every other quant type still goes
 // through dequantize_row()+dot_f32().
+
+// Cache-blocked fused Q4_0/Q8_0 projection of weight rows [r0,r1) against
+// `seq` pre-quantized activation positions. Positions are processed in
+// blocks sized so the block's int8 activations (~96 KB) stay resident in L2,
+// and for each position block every weight row group is streamed from memory
+// exactly ONCE (seq/PB passes over the weights instead of `seq` passes), with
+// a 4-row x 2-position register tile inside (tile4_*). Used by both
+// proj_all_positions() and proj_all_positions_multi().
+inline void proj_fast_rows(bool is_q4, const uint8_t* wbase, size_t row_bytes, size_t cols,
+                           size_t r0, size_t r1, size_t seq, float* Y, size_t y_stride,
+                           const float* bias, const float* q8_d, const int32_t* q8_sum,
+                           const int8_t* q8_q, const repack::Packed* pk = nullptr)
+{
+    const size_t nb = cols / 32;
+    // Repacked fast path (rawllm_repack.hpp): whole 8-row panels inside [r0, r1) go through the
+    // rows-in-lanes GEMM kernels; only the tail rows (rows % 8, or a unit not starting on a panel
+    // boundary) fall through to the legacy unpacked code below. Positions are blocked so the
+    // block's int8 activations (~96 KB) stay in L2 while each panel is streamed once per block.
+    if (pk && (r0 & 7) == 0) {
+        const size_t pend = std::min(r1, pk->rows) & ~(size_t)7;
+        if (pend > r0) {
+            const size_t PBp = std::clamp<size_t>((96 * 1024) / std::max<size_t>(cols, 1), 4, 64) & ~(size_t)3;
+            for (size_t pb = 0; pb < seq; pb += PBp) {
+                const size_t np = std::min(PBp, seq - pb);
+                repack::gemm(*pk, r0 / 8, (pend - r0) / 8, q8_d + pb * nb, q8_sum + pb * nb, q8_q + pb * cols,
+                             np, Y + pb * y_stride + r0, y_stride, bias ? bias + r0 : nullptr);
+            }
+            r0 = pend;
+        }
+        if (r0 >= r1) return;
+    }
+    size_t PB = std::clamp<size_t>((96 * 1024) / std::max<size_t>(cols, 1), 2, 64) & ~(size_t)1;
+    for (size_t pb = 0; pb < seq; pb += PB) {
+        size_t np = std::min(PB, seq - pb);
+        const float*   xd = q8_d + pb * nb;
+        const int32_t* xs = q8_sum + pb * nb;
+        const int8_t*  xq = q8_q + pb * cols;
+        float* Yp = Y + pb * y_stride;
+        size_t r = r0;
+        for (; r + 4 <= r1; r += 4) {
+            const uint8_t* w = wbase + r * row_bytes;
+            if (is_q4) tile4_q4_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            else       tile4_q8_0_q8_0(w, row_bytes, xd, xs, xq, cols, np, Yp + r, y_stride);
+            if (bias)
+                for (size_t t = 0; t < np; ++t)
+                    for (int j = 0; j < 4; ++j) Yp[t * y_stride + r + j] += bias[r + j];
+        }
+        for (; r < r1; ++r) {
+            const uint8_t* row = wbase + r * row_bytes;
+            float b = bias ? bias[r] : 0.f;
+            for (size_t t = 0; t < np; ++t)
+                Yp[t * y_stride + r] = (is_q4
+                    ? dot_q4_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)
+                    : dot_q8_0_q8_0(row, xd + t * nb, xs + t * nb, xq + t * cols, cols)) + b;
+        }
+    }
+}
+
+// Dynamic work distribution (llama.cpp-style chunk stealing): `n` rows are cut into chunks of
+// `chunk` rows (a multiple of 8 so panels never straddle chunks) handed out from an atomic counter.
+// The old static one-slice-per-thread split made every projection wait for the slowest thread; with
+// all cores busy (desktop session, SMT siblings, frequency dips) that is a measurable decode loss.
+inline size_t pick_row_chunk(size_t rows, int nthreads) {
+    size_t c = (rows + (size_t)nthreads * 6 - 1) / ((size_t)nthreads * 6);
+    c = (c + 7) & ~(size_t)7;
+    return std::clamp<size_t>(c, 8, 128);
+}
+template <typename Fn>
+inline void run_row_chunks(util::ThreadPool& pool, size_t rows, size_t chunk, Fn fn) {
+    const int nth = std::max(1, pool.size());
+    const size_t nchunks = (rows + chunk - 1) / chunk;
+    if (nth == 1 || nchunks <= 1) { fn((size_t)0, rows); return; }
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        for (;;) {
+            size_t c = next.fetch_add(1, std::memory_order_relaxed);
+            if (c >= nchunks) break;
+            fn(c * chunk, std::min(rows, (c + 1) * chunk));
+        }
+    };
+    const size_t ntasks = std::min<size_t>((size_t)nth, nchunks);
+    for (size_t i = 0; i < ntasks; ++i) pool.submit(worker);
+    pool.wait();
+}
 
 inline void proj_all_positions(const loader::TensorInfo& W,
                                 const float* X, size_t x_stride,
@@ -650,7 +731,7 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         if (q8_d.size() < seq * nb)   q8_d.resize(seq * nb);
         if (q8_q.size() < seq * cols) q8_q.resize(seq * cols);
         if (q8_sum.size() < seq * nb) q8_sum.resize(seq * nb);
-        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
+        quantize_rows_q8_0(X, x_stride, cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
     }
     const float*   q8_d_ptr   = q8_d.data();
     const int8_t*  q8_q_ptr   = q8_q.data();
@@ -671,6 +752,16 @@ inline void proj_all_positions(const loader::TensorInfo& W,
     // prefill in reasonable time on this hardware, so there's no real
     // cache-locality trade-off being given up here, just redundant reads
     // being removed.
+    if (use_q4_0_fast || use_q8_0_fast) {
+        // Packed panels (built once, cached by data pointer) + dynamic chunk scheduling.
+        const repack::Packed* pk = repack::get_or_build(W.data_ptr,
+            use_q4_0_fast ? repack::Kind::Q4_0 : repack::Kind::Q8_0, rows, cols, row_bytes, pool);
+        run_row_chunks(pool, rows, pick_row_chunk(rows, nthreads), [&](size_t r0, size_t r1) {
+            proj_fast_rows(use_q4_0_fast, W.data_ptr, row_bytes, cols, r0, r1, seq,
+                           Y, y_stride, bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr, pk);
+        });
+        return;
+    }
     size_t row_chunk = (rows + (size_t)nthreads - 1) / (size_t)nthreads;
     bool any = false;
     for (int ti = 0; ti < nthreads; ++ti) {
@@ -678,66 +769,7 @@ inline void proj_all_positions(const loader::TensorInfo& W,
         size_t r1 = std::min(rows, r0 + row_chunk);
         if (r0 >= r1) continue;
         any = true;
-        pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1,
-                     use_q4_0_fast, use_q8_0_fast, q8_d_ptr, q8_q_ptr, q8_sum_ptr, bias] {
-            size_t nb = cols / 32;
-            if (use_q4_0_fast) {
-                for (size_t t = 0; t < seq; ++t) {
-                    const float*   xd = q8_d_ptr + t * nb;
-                    const int32_t* xs = q8_sum_ptr + t * nb;
-                    const int8_t*  xq = q8_q_ptr + t * cols;
-                    size_t r = r0;
-                    // Batch 4 output rows per call — see the dot4_*
-                    // functions' comment in rawllm_simd_dispatch.hpp for
-                    // why (shares the activation-block load across 4
-                    // independent accumulator chains instead of 4 separate
-                    // single-row calls each reloading it).
-                    for (; r + 4 <= r1; r += 4) {
-                        float out4[4];
-                        dot4_q4_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
-                                       W.data_ptr + (r + 1) * row_bytes,
-                                       W.data_ptr + (r + 2) * row_bytes,
-                                       W.data_ptr + (r + 3) * row_bytes,
-                                       xd, xs, xq, cols, out4);
-                        Y[t * y_stride + r + 0] = out4[0] + (bias ? bias[r + 0] : 0.f);
-                        Y[t * y_stride + r + 1] = out4[1] + (bias ? bias[r + 1] : 0.f);
-                        Y[t * y_stride + r + 2] = out4[2] + (bias ? bias[r + 2] : 0.f);
-                        Y[t * y_stride + r + 3] = out4[3] + (bias ? bias[r + 3] : 0.f);
-                    }
-                    for (; r < r1; ++r) {
-                        const uint8_t* row = W.data_ptr + r * row_bytes;
-                        float b = bias ? bias[r] : 0.f;
-                        Y[t * y_stride + r] = dot_q4_0_q8_0(row, xd, xs, xq, cols) + b;
-                    }
-                }
-                return;
-            }
-            if (use_q8_0_fast) {
-                for (size_t t = 0; t < seq; ++t) {
-                    const float*   xd = q8_d_ptr + t * nb;
-                    const int32_t* xs = q8_sum_ptr + t * nb;
-                    const int8_t*  xq = q8_q_ptr + t * cols;
-                    size_t r = r0;
-                    for (; r + 4 <= r1; r += 4) {
-                        float out4[4];
-                        dot4_q8_0_q8_0(W.data_ptr + (r + 0) * row_bytes,
-                                       W.data_ptr + (r + 1) * row_bytes,
-                                       W.data_ptr + (r + 2) * row_bytes,
-                                       W.data_ptr + (r + 3) * row_bytes,
-                                       xd, xs, xq, cols, out4);
-                        Y[t * y_stride + r + 0] = out4[0] + (bias ? bias[r + 0] : 0.f);
-                        Y[t * y_stride + r + 1] = out4[1] + (bias ? bias[r + 1] : 0.f);
-                        Y[t * y_stride + r + 2] = out4[2] + (bias ? bias[r + 2] : 0.f);
-                        Y[t * y_stride + r + 3] = out4[3] + (bias ? bias[r + 3] : 0.f);
-                    }
-                    for (; r < r1; ++r) {
-                        const uint8_t* row = W.data_ptr + r * row_bytes;
-                        float b = bias ? bias[r] : 0.f;
-                        Y[t * y_stride + r] = dot_q8_0_q8_0(row, xd, xs, xq, cols) + b;
-                    }
-                }
-                return;
-            }
+        pool.submit([&W, X, x_stride, Y, y_stride, cols, row_bytes, seq, r0, r1, bias] {
             // FIX (perf): this used to be `std::vector<float> rowbuf(cols);`
             // declared fresh inside the lambda — a heap alloc+free on every
             // single dispatched task. proj_all_positions_multi() runs this
@@ -825,6 +857,7 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         float* Y;
         FastKind fast;
         const float* bias;
+        const repack::Packed* pk;
     };
     std::vector<Span> spans;
     spans.reserve(targets_ref.size());
@@ -863,7 +896,11 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
                     "but not safe to assume in general.");
             any_fast_cols = cols;
         }
-        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast, tg.bias});
+        const repack::Packed* pk = nullptr;
+        if (fast != FastKind::None)
+            pk = repack::get_or_build(tg.W->data_ptr, fast == FastKind::Q4_0 ? repack::Kind::Q4_0 : repack::Kind::Q8_0,
+                                      rows, cols, row_bytes, pool);
+        spans.push_back({tg.W, row_bytes, cols, tg.y_stride, total, total + rows, tg.Y, fast, tg.bias, pk});
         total += rows;
     }
 
@@ -875,54 +912,51 @@ inline void proj_all_positions_multi(const std::vector<ProjTarget>& targets,
         if (q8_d.size() < seq * nb)             q8_d.resize(seq * nb);
         if (q8_q.size() < seq * any_fast_cols)  q8_q.resize(seq * any_fast_cols);
         if (q8_sum.size() < seq * nb)           q8_sum.resize(seq * nb);
-        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data());
+        quantize_rows_q8_0(X, x_stride, any_fast_cols, seq, q8_d.data(), q8_q.data(), q8_sum.data(), &pool);
     }
     const float*   q8_d_ptr   = q8_d.data();
     const int8_t*  q8_q_ptr   = q8_q.data();
     const int32_t* q8_sum_ptr = q8_sum.data();
 
-    int nthreads = std::max(1, pool.size());
-    size_t chunk = (total + (size_t)nthreads - 1) / (size_t)nthreads;
-    bool any = false;
-    for (int ti = 0; ti < nthreads; ++ti) {
-        size_t g0 = (size_t)ti * chunk, g1 = std::min(total, g0 + chunk);
-        if (g0 >= g1) continue;
-        any = true;
-        pool.submit([&spans, X, x_stride, seq, g0, g1, q8_d_ptr, q8_q_ptr, q8_sum_ptr] {
-            thread_local std::vector<float> rowbuf;
-            for (const auto& sp : spans) {
-                size_t lo = std::max(g0, sp.r0_global);
-                size_t hi = std::min(g1, sp.r1_global);
-                if (lo >= hi) continue;
-                if (sp.fast != FastKind::None) {
-                    size_t nb = sp.cols / 32;
-                    for (size_t g = lo; g < hi; ++g) {
-                        size_t r = g - sp.r0_global;
-                        const uint8_t* row = sp.W->data_ptr + r * sp.row_bytes;
-                        float b = sp.bias ? sp.bias[r] : 0.f;
-                        for (size_t t = 0; t < seq; ++t)
-                            sp.Y[t * sp.y_stride + r] = ((sp.fast == FastKind::Q4_0)
-                                ? dot_q4_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols)
-                                : dot_q8_0_q8_0(row, q8_d_ptr + t * nb, q8_sum_ptr + t * nb,
-                                                q8_q_ptr + t * sp.cols, sp.cols)) + b;
-                    }
-                    continue;
-                }
-                if (rowbuf.size() < sp.cols) rowbuf.resize(sp.cols);
-                for (size_t g = lo; g < hi; ++g) {
-                    size_t r = g - sp.r0_global;
-                    dequantize_row(sp.W->type, sp.W->data_ptr + r * sp.row_bytes, sp.cols, rowbuf.data());
-                    float b = sp.bias ? sp.bias[r] : 0.f;
-                    for (size_t t = 0; t < seq; ++t) {
-                        const float* x = X + t * x_stride;
-                        sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), x, sp.cols) + b;
-                    }
-                }
-            }
-        });
+    // Dynamic scheduling over (span, row-chunk) units. Chunks are multiples of 8 rows inside a span
+    // so packed panels never straddle two units; units are pulled from an atomic counter.
+    const int nthreads = std::max(1, pool.size());
+    struct Unit { uint32_t span; uint32_t lo, hi; };
+    std::vector<Unit> units;
+    const size_t chunk = pick_row_chunk(total, nthreads);
+    for (size_t si = 0; si < spans.size(); ++si) {
+        const size_t rows = spans[si].r1_global - spans[si].r0_global;
+        for (size_t r = 0; r < rows; r += chunk)
+            units.push_back({(uint32_t)si, (uint32_t)r, (uint32_t)std::min(rows, r + chunk)});
     }
-    if (any) pool.wait();
+    auto do_unit = [&](const Unit& u) {
+        thread_local std::vector<float> rowbuf;
+        const Span& sp = spans[u.span];
+        if (sp.fast != FastKind::None) {
+            proj_fast_rows(sp.fast == FastKind::Q4_0, sp.W->data_ptr, sp.row_bytes, sp.cols,
+                           u.lo, u.hi, seq, sp.Y, sp.y_stride, sp.bias, q8_d_ptr, q8_sum_ptr, q8_q_ptr, sp.pk);
+            return;
+        }
+        if (rowbuf.size() < sp.cols) rowbuf.resize(sp.cols);
+        for (size_t r = u.lo; r < u.hi; ++r) {
+            dequantize_row(sp.W->type, sp.W->data_ptr + r * sp.row_bytes, sp.cols, rowbuf.data());
+            float b = sp.bias ? sp.bias[r] : 0.f;
+            for (size_t t = 0; t < seq; ++t)
+                sp.Y[t * sp.y_stride + r] = dot_f32(rowbuf.data(), X + t * x_stride, sp.cols) + b;
+        }
+    };
+    if (nthreads == 1 || units.size() <= 1) { for (const auto& u : units) do_unit(u); return; }
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= units.size()) break;
+            do_unit(units[i]);
+        }
+    };
+    const size_t ntasks = std::min<size_t>((size_t)nthreads, units.size());
+    for (size_t i = 0; i < ntasks; ++i) pool.submit(worker);
+    pool.wait();
 }
 
 // ───────────────────────── norm / activation ────────────────────────────────
@@ -979,6 +1013,37 @@ inline void rope_apply(float* vec, size_t n_heads_local, size_t head_dim, size_t
             v[2*i + 1] = x0 * s + x1 * c;
         }
     }
+}
+
+// Same rotation as rope_apply(), but with cos/sin precomputed per (position,
+// pair) — they depend only on position and pair index, not on head or layer,
+// so the old code recomputed each cos/sin n_heads * n_layer times.
+inline void rope_apply_tab(float* vec, size_t n_heads_local, size_t head_dim, size_t half,
+                            const float* cos_t, const float* sin_t)
+{
+    for (size_t h = 0; h < n_heads_local; ++h) {
+        float* v = vec + h * head_dim;
+        for (size_t i = 0; i < half; ++i) {
+            float c = cos_t[i], s = sin_t[i];
+            float x0 = v[2*i], x1 = v[2*i + 1];
+            v[2*i]     = x0 * c - x1 * s;
+            v[2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// Runs fn(begin, end) over [0, n) split across the pool; inline when the
+// range is too small to be worth a barrier.
+template <typename Fn>
+inline void parallel_range(util::ThreadPool& pool, size_t n, size_t min_per_task, Fn fn) {
+    int nth = std::max(1, pool.size());
+    if (nth == 1 || n < 2 * min_per_task) { fn((size_t)0, n); return; }
+    size_t chunk = std::max(min_per_task, (n + (size_t)nth - 1) / (size_t)nth);
+    for (size_t b = 0; b < n; b += chunk) {
+        size_t e = std::min(n, b + chunk);
+        pool.submit([=] { fn(b, e); });
+    }
+    pool.wait();
 }
 
 // Rotates an already-RoPE'd vector by a signed position DELTA, instead of
@@ -1118,6 +1183,27 @@ struct ModelWeights {
         return mw;
     }
 };
+
+// Eagerly builds every packed weight panel set (otherwise built lazily on first use inside the
+// first forward call). Call once after loading, e.g. right after ModelWeights::build(), so the
+// one-time pass over the weights doesn't land in first-token latency. No-op when RAWLLM_NO_REPACK=1.
+inline void prepack_model(const ModelWeights& mw, util::ThreadPool& pool) {
+    auto one = [&](const loader::TensorInfo* t) {
+        if (!t || t->shape.size() < 2) return;
+        repack::Kind k;
+        if (t->type == loader::GGMLType::Q4_0) k = repack::Kind::Q4_0;
+        else if (t->type == loader::GGMLType::Q8_0) k = repack::Kind::Q8_0;
+        else return;
+        size_t cols = (size_t)t->shape[0], rows = (size_t)t->shape[1];
+        if (cols % 32) return;
+        repack::get_or_build(t->data_ptr, k, rows, cols, loader::GGUFLoader::bytes_for_type(t->type, cols), pool);
+    };
+    for (const auto& L : mw.layers) {
+        one(L.attn_q); one(L.attn_k); one(L.attn_v); one(L.attn_out);
+        one(L.ffn_gate); one(L.ffn_up); one(L.ffn_down);
+    }
+    one(mw.output ? mw.output : mw.token_embd);
+}
 
 // ───────────────────────── KV cache ──────────────────────────────────────────
 // Per-layer K/V storage across calls, indexed by absolute sequence position.
@@ -1450,6 +1536,15 @@ inline void transformer_forward(const engine::Config& cfg,
     // O(n_layer × seq × n_head × head_dim/2).
     const std::vector<float> rope_freqs = rope_make_freqs(head_dim, cfg.rope_base);
     const size_t rope_half = cfg.rope_dim_count ? (cfg.rope_dim_count / 2) : (head_dim / 2);
+    std::vector<float> rope_cos(seq * rope_half), rope_sin(seq * rope_half);
+    for (size_t t = 0; t < seq; ++t) {
+        float fpos = (float)(base_pos + t) / cfg.rope_scale;
+        for (size_t i = 0; i < rope_half; ++i) {
+            float theta = fpos * rope_freqs[i];
+            rope_cos[t * rope_half + i] = std::cos(theta);
+            rope_sin[t * rope_half + i] = std::sin(theta);
+        }
+    }
 
     // Hidden state, one row per NEW position: h[t*n_embd .. +n_embd).
     // Earlier positions never re-enter the residual stream here — their
@@ -1510,8 +1605,10 @@ inline void transformer_forward(const engine::Config& cfg,
 
         // ── attn_norm + RMSNorm ──────────────────────────────────────────
         dequant_full(*L.attn_norm, w_norm.data());
-        for (size_t t = 0; t < seq; ++t)
-            rms_norm(&h[t * n_embd], w_norm.data(), &normed[t * n_embd], n_embd, cfg.norm_eps);
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
         stage_mark(us_norm);
 
         // ── Q/K/V projections (always separate — no fused-QKV variant) ──
@@ -1529,8 +1626,8 @@ inline void transformer_forward(const engine::Config& cfg,
         // ── RoPE, using each token's ABSOLUTE position (base_pos + t) ──────
         // rope_freqs was computed once before this loop; no std::pow here.
         for (size_t t = 0; t < seq; ++t) {
-            rope_apply(&q[t * q_dim],  n_head,    head_dim, rope_half, base_pos + t, cfg.rope_scale, rope_freqs.data());
-            rope_apply(&k[t * kv_dim], n_kv_head, head_dim, rope_half, base_pos + t, cfg.rope_scale, rope_freqs.data());
+            rope_apply_tab(&q[t * q_dim],  n_head,    head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
+            rope_apply_tab(&k[t * kv_dim], n_kv_head, head_dim, rope_half, &rope_cos[t * rope_half], &rope_sin[t * rope_half]);
         }
 
         // ── Write this layer's new K/V into the cache BEFORE attention ───
@@ -1550,46 +1647,45 @@ inline void transformer_forward(const engine::Config& cfg,
         // case) — flattening in the head dimension too is what lets a
         // single new token still use every available thread.
         {
+            // Units are (position, head) pairs, handed out DYNAMICALLY from an
+            // atomic counter, heaviest (latest position) first. The old static
+            // split gave the last thread the longest causal rows (~1.8x the
+            // average load at 6 threads), so everyone waited on it.
             const size_t total_units = seq * n_head;
             int nthreads = std::max(1, pool.size());
-            size_t chunk = (total_units + (size_t)nthreads - 1) / (size_t)nthreads;
-            bool any = false;
-            for (int ti = 0; ti < nthreads; ++ti) {
-                size_t u0 = (size_t)ti * chunk, u1 = std::min(total_units, u0 + chunk);
-                if (u0 >= u1) continue;
-                any = true;
-                pool.submit([&, u0, u1] {
-                    std::vector<float> scores(base_pos + seq);
-                    for (size_t u = u0; u < u1; ++u) {
-                        size_t t  = u / n_head;
-                        size_t hh = u % n_head;
-                        size_t abs_t = base_pos + t;
-                        size_t kvh   = hh / group;
-                        const float* qv  = &q[t * q_dim + hh * head_dim];
-                        size_t klen = abs_t + 1;   // causal: attend to [0, abs_t] inclusive
+            std::atomic<size_t> next_unit{0};
+            const size_t vstride = kv_dim;
+            auto attn_worker = [&] {
+                std::vector<float> scores(base_pos + seq), coeff(base_pos + seq);
+                for (;;) {
+                    size_t idx = next_unit.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= total_units) break;
+                    size_t t  = seq - 1 - idx / n_head;
+                    size_t hh = idx % n_head;
+                    size_t abs_t = base_pos + t;
+                    size_t kvh   = hh / group;
+                    const float* qv  = &q[t * q_dim + hh * head_dim];
+                    size_t klen = abs_t + 1;   // causal: attend to [0, abs_t] inclusive
 
-                        float maxs = -std::numeric_limits<float>::infinity();
-                        for (size_t s = 0; s < klen; ++s) {
-                            float dot = dot_f32(qv, cache.k_row(li, s) + kvh * head_dim, head_dim) * scale;
-                            scores[s] = dot;
-                            if (dot > maxs) maxs = dot;
-                        }
-                        float sum = 0.f;
-                        for (size_t s = 0; s < klen; ++s) { scores[s] = engine::fast_expf(scores[s] - maxs); sum += scores[s]; }
-                        float inv = 1.0f / sum;
-                        float* outp = &attn_out[t * q_dim + hh * head_dim];
-                        std::fill(outp, outp + head_dim, 0.f);
-                        for (size_t s = 0; s < klen; ++s) {
-                            // v_scale folded into the coefficient here so
-                            // axpy_i8 itself stays a plain int8-weighted
-                            // accumulate with no per-call scale lookup.
-                            float coeff = scores[s] * inv * cache.v_scale(li, s, kvh);
-                            axpy_i8(outp, coeff, cache.v_row_q(li, s) + kvh * head_dim, head_dim);
-                        }
-                    }
-                });
+                    // batched Q.K^T (8 keys per pass, see simd::attn_scores) instead of one dot_f32() call per key
+                    float maxs = attn_scores(qv, cache.k_row(li, 0) + kvh * head_dim, kv_dim, klen, head_dim, scale, scores.data());
+                    float sum = 0.f;
+                    for (size_t s2 = 0; s2 < klen; ++s2) { scores[s2] = engine::fast_expf(scores[s2] - maxs); sum += scores[s2]; }
+                    float inv = 1.0f / sum;
+                    // softmax weight and this position's int8 V scale folded into one coefficient
+                    for (size_t s2 = 0; s2 < klen; ++s2)
+                        coeff[s2] = scores[s2] * inv * cache.v_scale(li, s2, kvh);
+                    attn_wsum_i8(&attn_out[t * q_dim + hh * head_dim], coeff.data(),
+                                 cache.v_row_q(li, 0) + kvh * head_dim, vstride, klen, head_dim);
+                }
+            };
+            size_t ntasks = std::min<size_t>((size_t)nthreads, total_units);
+            if (ntasks <= 1) {
+                attn_worker();
+            } else {
+                for (size_t ti = 0; ti < ntasks; ++ti) pool.submit(attn_worker);
+                pool.wait();
             }
-            if (any) pool.wait();
         }
         stage_mark(us_attn);
 
@@ -1601,8 +1697,10 @@ inline void transformer_forward(const engine::Config& cfg,
 
         // ── FFN: RMSNorm -> SwiGLU -> down-proj + residual ──────────────
         dequant_full(*L.ffn_norm, w_norm.data());
-        for (size_t t = 0; t < seq; ++t)
-            rms_norm(&h[t * n_embd], w_norm.data(), &ff_normed[t * n_embd], n_embd, cfg.norm_eps);
+        parallel_range(pool, seq, 8, [&](size_t t0, size_t t1) {
+            for (size_t t = t0; t < t1; ++t)
+                rms_norm(&h[t * n_embd], w_norm.data(), &ff_normed[t * n_embd], n_embd, cfg.norm_eps);
+        });
         stage_mark(us_norm);
 
         // ── FFN: gate + up projections ────────────────────────────────────
@@ -1625,11 +1723,15 @@ inline void transformer_forward(const engine::Config& cfg,
                 {L.ffn_gate, gate_buf.data(), n_ff, L.ffn_gate_bias},
                 {L.ffn_up,   up_buf.data(),   n_ff, L.ffn_up_bias},
             }, ff_normed.data(), n_embd, seq, pool);
-            for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(gate_buf[i]) * up_buf[i];
+            });
         } else {
             // Plain SiLU-FFN: no gate projection — silu applied directly to up.
             proj_all_positions(*L.ffn_up, ff_normed.data(), n_embd, up_buf.data(), n_ff, seq, pool, L.ffn_up_bias);
-            for (size_t i = 0; i < seq * n_ff; ++i) ff_act[i] = silu(up_buf[i]);
+            parallel_range(pool, seq * n_ff, 8192, [&](size_t b0, size_t b1) {
+                for (size_t i = b0; i < b1; ++i) ff_act[i] = silu(up_buf[i]);
+            });
         }
         stage_mark(us_proj);
 
