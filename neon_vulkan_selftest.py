@@ -289,6 +289,62 @@ def ensure_vulkan_runtime(args):
     return devs
 
 
+def is_software(names):
+    return bool(names) and all(re.search(r"llvmpipe|lavapipe|swrast|softpipe", n, re.I) for n in names)
+
+
+def find_nvidia_vk_lib():
+    """Locate NVIDIA's Vulkan userspace driver (libGLX_nvidia.so.0), or None."""
+    r = sh(["ldconfig", "-p"]) if shutil.which("ldconfig") else None
+    if r and r.returncode == 0:
+        m = re.search(r"libGLX_nvidia\.so\.0 .*=> (\S+)", r.stdout)
+        if m:
+            return m.group(1)
+    for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/nvidia/lib64", "/usr/local/nvidia/lib"):
+        hits = sorted(Path(d).glob("libGLX_nvidia.so*")) if Path(d).is_dir() else []
+        if hits:
+            return str(hits[0])
+    return None
+
+
+def ensure_nvidia_vulkan(args, build: Path, devs):
+    """NVIDIA GPU present (nvidia-smi works) but Vulkan only sees software devices -> set up NVIDIA's Vulkan ICD.
+    Colab etc. ship the CUDA driver but not the Vulkan userspace driver, so the loader finds only lavapipe."""
+    if not shutil.which("nvidia-smi") or (devs and not is_software(devs)):
+        return devs
+    q = sh(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"])
+    if q.returncode != 0 or not q.stdout.strip():
+        return devs
+    gpu, ver = [x.strip() for x in q.stdout.strip().splitlines()[0].split(",", 1)]
+    major = ver.split(".")[0]
+    print(f"NVIDIA GPU detected ({gpu}, driver {ver}) but Vulkan only lists: {', '.join(devs) if devs else 'nothing'}")
+    lib = find_nvidia_vk_lib()
+    if not lib and not args.no_auto_install and pkg_manager() == "apt":
+        print(f"  NVIDIA Vulkan driver (libGLX_nvidia) not installed; trying libnvidia-gl-{major}")
+        for pkg in (f"libnvidia-gl-{major}", f"libnvidia-gl-{major}-server"):
+            if pm_install("apt", [pkg]):
+                lib = find_nvidia_vk_lib()
+                if lib:
+                    break
+        if lib:
+            print("  note: the userspace driver version must match the kernel driver exactly "
+                  f"({ver}); if Vulkan init fails below, that mismatch is the likely cause.")
+    if not lib:
+        print("  could not find/install libGLX_nvidia.so.0, staying on the software device.")
+        return devs
+    icd = build / "nvidia_icd.json"
+    icd.write_text(json.dumps({"file_format_version": "1.0.0", "ICD": {"library_path": lib, "api_version": "1.3.0"}}))
+    icds = [str(icd)]
+    for cand in ("/usr/share/vulkan/icd.d/lvp_icd.json", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"):
+        if Path(cand).exists():
+            icds.append(cand)  # keep lavapipe as a fallback; the backend prefers the real GPU
+            break
+    os.environ["VK_ICD_FILENAMES"] = os.pathsep.join(icds)
+    print("  using NVIDIA ICD:", lib)
+    new = device_summary()
+    return new or devs
+
+
 def device_summary():
     vi = which_any("vulkaninfo")
     if not vi:
@@ -631,6 +687,7 @@ def main():
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--shaders-only", action="store_true", help="only compile shaders and report")
     ap.add_argument("--lavapipe", action="store_true", help="force Mesa lavapipe (CPU Vulkan) via VK_ICD_FILENAMES")
+    ap.add_argument("--require-gpu", action="store_true", help="exit with an error if only a software Vulkan device is available")
     ap.add_argument("--no-auto-install", action="store_true", help="don't install/download missing tools; just report them")
     ap.add_argument("--install-deps", action="store_true", help=argparse.SUPPRESS)  # legacy, now the default behaviour
     ap.add_argument("--report", default="vulkan_selftest_report.json")
@@ -660,8 +717,13 @@ def main():
         return 3
 
     devs = ensure_vulkan_runtime(args)
+    if not args.lavapipe:
+        devs = ensure_nvidia_vulkan(args, build, devs)
     print("Vulkan devices  :", ", ".join(d.strip() for d in devs) if devs else "(none found: the backend will fail to construct)")
 
+    if args.require_gpu and (not devs or is_software(devs)) and not args.lavapipe:
+        print("\n--require-gpu: only software Vulkan device(s) visible. Aborting.")
+        return 6
     if args.lavapipe:
         for p in ("/usr/share/vulkan/icd.d/lvp_icd.json", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"):
             if Path(p).exists():
@@ -745,8 +807,10 @@ def main():
         print(f"\n{'benchmark':<34}{'us/call':>10}{'GFLOP/s':>10}{'GB/s':>9}")
         for r in bn:
             print(f"{r['name']:<34}{r['us']:>10.1f}{r['gflops']:>10.1f}{r['gbs']:>9.1f}")
-        if devs and any("llvmpipe" in d or "lavapipe" in d.lower() for d in devs):
+        if is_software(devs):
             print("(device is a software rasterizer: timings are meaningless, only correctness counts)")
+            if shutil.which("nvidia-smi"):
+                print("An NVIDIA GPU is present but was NOT used: Vulkan can't see its driver. Re-run with --require-gpu to fail fast.")
     passed = sum(r["status"] == "PASS" for r in results)
     skipped = sum(r["status"] == "SKIP" for r in results)
     print(f"\n{passed} passed, {fails} failed, {skipped} skipped  ({time.time() - t0:.1f}s)")
