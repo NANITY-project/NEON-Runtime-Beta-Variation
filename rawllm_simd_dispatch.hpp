@@ -682,6 +682,63 @@ inline void quantize_row_q8_0(const float* x, size_t cols, float* d_out, int8_t*
     }
 }
 
+// ───────────────────────── attention score kernel (Q . K^T) ─────────────────────────
+// out[s] = scale * dot(q, K + s*kstride, hd) for s in [0, klen); returns max(out).
+// PREVIOUSLY the attention loop called dot_f32() once per key: an ifunc'd (non-inlinable) call plus
+// a full horizontal reduction per key, ~50% of attention time. Here 8 keys are scored at once:
+// q is loaded once per 8 floats, 8 independent FMA chains hide the FMA latency, and the 8 horizontal
+// sums are produced together with a hadd tree. Summation order differs from dot_f32 (fp reassociation).
+__attribute__((target("default")))
+inline float attn_scores(const float* q, const float* K, size_t kstride, size_t klen, size_t hd,
+                         float scale, float* out) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (size_t s = 0; s < klen; ++s) {
+        float v = scalar::dot_f32(q, K + s * kstride, hd) * scale;
+        out[s] = v; if (v > mx) mx = v;
+    }
+    return mx;
+}
+__attribute__((target("avx2,fma")))
+inline float attn_scores(const float* q, const float* K, size_t kstride, size_t klen, size_t hd,
+                         float scale, float* out) {
+    float mx = -std::numeric_limits<float>::infinity();
+    const size_t hd8 = hd & ~(size_t)7;
+    size_t s = 0;
+    for (; s + 8 <= klen; s += 8) {
+        const float* k[8];
+        for (int j = 0; j < 8; ++j) k[j] = K + (s + j) * kstride;
+        __m256 a[8];
+        for (int j = 0; j < 8; ++j) a[j] = _mm256_setzero_ps();
+        for (size_t i = 0; i < hd8; i += 8) {
+            __m256 qv = _mm256_loadu_ps(q + i);
+            for (int j = 0; j < 8; ++j) a[j] = _mm256_fmadd_ps(qv, _mm256_loadu_ps(k[j] + i), a[j]);
+        }
+        __m256 h01 = _mm256_hadd_ps(a[0], a[1]), h23 = _mm256_hadd_ps(a[2], a[3]);
+        __m256 h45 = _mm256_hadd_ps(a[4], a[5]), h67 = _mm256_hadd_ps(a[6], a[7]);
+        __m256 hA = _mm256_hadd_ps(h01, h23), hB = _mm256_hadd_ps(h45, h67);   // per lane: [k0..k3] / [k4..k7] partials
+        __m128 rA = _mm_add_ps(_mm256_castps256_ps128(hA), _mm256_extractf128_ps(hA, 1));
+        __m128 rB = _mm_add_ps(_mm256_castps256_ps128(hB), _mm256_extractf128_ps(hB, 1));
+        alignas(16) float r[8];
+        _mm_store_ps(r, rA); _mm_store_ps(r + 4, rB);
+        for (int j = 0; j < 8; ++j) {
+            float t = r[j];
+            for (size_t i = hd8; i < hd; ++i) t += q[i] * k[j][i];          // head_dim not a multiple of 8
+            t *= scale; out[s + j] = t; if (t > mx) mx = t;
+        }
+    }
+    for (; s < klen; ++s) {
+        const float* kr = K + s * kstride;
+        __m256 acc = _mm256_setzero_ps();
+        for (size_t i = 0; i < hd8; i += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), _mm256_loadu_ps(kr + i), acc);
+        __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        v = _mm_add_ps(v, _mm_movehl_ps(v, v)); v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+        float t = _mm_cvtss_f32(v);
+        for (size_t i = hd8; i < hd; ++i) t += q[i] * kr[i];
+        t *= scale; out[s] = t; if (t > mx) mx = t;
+    }
+    return mx;
+}
+
 #if defined(RAWLLM_SIMD_SELFTEST)
 #include <random>
 #include <vector>
@@ -880,6 +937,22 @@ inline bool run_selftest() {
                 ok = false;
             }
         }
+    }
+
+    // attn_scores vs scalar reference (various klen / head_dim incl. non-multiples of 8)
+    for (int trial = 0; trial < 200; ++trial) {
+        size_t hd = 8 + (rng() % 140), klen = 1 + (rng() % 40), stride = hd + (rng() % 16);
+        std::vector<float> q(hd), K(klen * stride), o(klen);
+        for (auto& v : q) v = fdist(rng);
+        for (auto& v : K) v = fdist(rng);
+        float mx = attn_scores(q.data(), K.data(), stride, klen, hd, 0.37f, o.data());
+        float rmx = -1e30f;
+        for (size_t s2 = 0; s2 < klen; ++s2) {
+            float ref = scalar::dot_f32(q.data(), K.data() + s2 * stride, hd) * 0.37f;
+            rmx = std::max(rmx, ref);
+            if (std::fabs(ref - o[s2]) > 1e-3f * std::max(1.0f, std::fabs(ref))) { std::fprintf(stderr, "[simd selftest] attn_scores mismatch hd=%zu klen=%zu s=%zu\n", hd, klen, s2); ok = false; break; }
+        }
+        if (std::fabs(rmx - mx) > 1e-3f * std::max(1.0f, std::fabs(rmx))) { std::fprintf(stderr, "[simd selftest] attn_scores max mismatch\n"); ok = false; }
     }
 
     // dot4_q4_0_q8_0 / dot4_q8_0_q8_0 (register-tiled 4-row batch) vs 4
