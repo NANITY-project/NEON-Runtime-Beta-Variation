@@ -259,6 +259,13 @@ struct GpuTensor {
     // return a smaller range than was actually reserved and leak the
     // tail of every freed tensor's allocation.
     VkDeviceSize alloc_size = 0;
+    // True iff this tensor was produced by upload_weight_q4_0_v2()/
+    // upload_weight_q8_0_v2() — i.e. repacked into the 128-bit-aligned
+    // [quants][scales] layout matvec_q4_0_v2.comp/matvec_q8_0_v2.comp read.
+    // queue_matvec_q4_0()/_q8_0() route on this flag, so callers use the
+    // same API either way. A packed tensor MUST NOT be passed to the
+    // legacy-layout GEMM paths (queue_matmul_q4_0()/_q8_0()).
+    bool packed = false;
 };
 
 // Experimental single-device, single-queue Vulkan compute backend for the
@@ -338,6 +345,14 @@ public:
         if (pipeline_f32_multirow_1_) vkDestroyPipeline(device_, pipeline_f32_multirow_1_, nullptr);
         if (pipeline_f32_multirow_2_) vkDestroyPipeline(device_, pipeline_f32_multirow_2_, nullptr);
         if (pipeline_f32_multirow_4_) vkDestroyPipeline(device_, pipeline_f32_multirow_4_, nullptr);
+        for (int i = 0; i < 3; ++i) {
+            if (pipeline_q4v2_[i]) vkDestroyPipeline(device_, pipeline_q4v2_[i], nullptr);
+            if (pipeline_q8v2_[i]) vkDestroyPipeline(device_, pipeline_q8v2_[i], nullptr);
+        }
+        if (pipeline_matmul_f16_) vkDestroyPipeline(device_, pipeline_matmul_f16_, nullptr);
+        if (pipeline_matmul_f32_) vkDestroyPipeline(device_, pipeline_matmul_f32_, nullptr);
+        if (pipeline_matmul_q4_0_) vkDestroyPipeline(device_, pipeline_matmul_q4_0_, nullptr);
+        if (pipeline_matmul_q8_0_) vkDestroyPipeline(device_, pipeline_matmul_q8_0_, nullptr);
         if (pipeline_layout3_) vkDestroyPipelineLayout(device_, pipeline_layout3_, nullptr);
         if (pipeline_layout5_) vkDestroyPipelineLayout(device_, pipeline_layout5_, nullptr);
         if (desc_set_layout3_) vkDestroyDescriptorSetLayout(device_, desc_set_layout3_, nullptr);
@@ -375,6 +390,39 @@ public:
         if (cols % 32 != 0) throw std::runtime_error("rawllm_vulkan: Q8_0 weight cols must be a multiple of 32");
         return upload_weight_bytes(raw_blocks, (VkDeviceSize)rows * (cols / 32) * 34);
     }
+
+    // ── v2 (repacked) quantized weights ─────────────────────────────────
+    // Same inputs as upload_weight_q4_0()/_q8_0() (the on-disk 18-/34-byte
+    // block stream), but repacked ONCE here into [quants][scales] with every
+    // block's quants 16-/32-byte aligned, so matvec_q4_0_v2.comp/
+    // matvec_q8_0_v2.comp can do coalesced 128-bit loads (see those headers
+    // for the exact layout and why the on-disk layout can't). One-time load
+    // cost, same total bytes; queue_matvec_q4_0()/_q8_0() then pick the v2
+    // pipelines automatically from GpuTensor::packed. Falls back to the
+    // legacy upload when the v2 pipelines weren't built.
+    GpuTensor upload_weight_q4_0_v2(const uint8_t* raw_blocks, size_t rows, size_t cols) {
+        if (cols % 32 != 0) throw std::runtime_error("rawllm_vulkan: Q4_0 weight cols must be a multiple of 32");
+        if (!quant_v2_available()) return upload_weight_q4_0(raw_blocks, rows, cols);
+        return upload_packed_quant(raw_blocks, rows * (cols / 32), 18, 16);
+    }
+    GpuTensor upload_weight_q8_0_v2(const uint8_t* raw_blocks, size_t rows, size_t cols) {
+        if (cols % 32 != 0) throw std::runtime_error("rawllm_vulkan: Q8_0 weight cols must be a multiple of 32");
+        if (!quant_v2_available()) return upload_weight_q8_0(raw_blocks, rows, cols);
+        return upload_packed_quant(raw_blocks, rows * (cols / 32), 34, 32);
+    }
+
+    // True iff matvec_q4_0_v2/matvec_q8_0_v2 pipelines were built.
+    bool quant_v2_available() const { return pipeline_q4v2_[1] != VK_NULL_HANDLE && pipeline_q8v2_[1] != VK_NULL_HANDLE; }
+    // True iff those pipelines are the dp4a (VK_KHR_shader_integer_dot_product) builds.
+    bool quant_v2_dp4a() const { return quant_v2_dp4a_; }
+    // Rows each subgroup finishes in the v2 kernels: 1, 2 (default) or 4.
+    // Larger amortizes the activation loads across more weight rows; the
+    // best value is hardware dependent — benchmark with it on your device.
+    void set_quant_rows_per_sg(uint32_t nr) {
+        if (nr != 1 && nr != 2 && nr != 4) throw std::runtime_error("rawllm_vulkan: quant rows_per_sg must be 1, 2 or 4");
+        quant_nr_ = nr;
+    }
+    uint32_t quant_rows_per_sg() const { return quant_nr_; }
 
     void free_tensor(GpuTensor& t) {
         if (t.buf) vkDestroyBuffer(device_, t.buf, nullptr);
@@ -603,6 +651,7 @@ public:
     // been passed to wait_batch().
     void queue_matvec_q4_0(const GpuTensor& W, const float* x_d, const int32_t* x_sum,
                             const int8_t* x_q, float* y, uint32_t cols, uint32_t rows) {
+        if (W.packed) { queue_matvec_quantized_v2(pipeline_q4v2_[nr_index()], W, x_d, x_sum, x_q, y, cols, rows); return; }
         queue_matvec_quantized(pipeline_q4_0_, W, x_d, x_sum, x_q, y, cols, rows);
     }
 
@@ -621,6 +670,7 @@ public:
     // Q8_0 has no zero-point to correct for.
     void queue_matvec_q8_0(const GpuTensor& W, const float* x_d, const int32_t* x_sum,
                             const int8_t* x_q, float* y, uint32_t cols, uint32_t rows) {
+        if (W.packed) { queue_matvec_quantized_v2(pipeline_q8v2_[nr_index()], W, x_d, x_sum, x_q, y, cols, rows); return; }
         queue_matvec_quantized(pipeline_q8_0_, W, x_d, x_sum, x_q, y, cols, rows);
     }
 
@@ -822,8 +872,8 @@ public:
     // make that choice for you; see this file's header comment (point 10).
     void queue_matmul_f16(const GpuTensor& Wf16, const float* X, float* Y, uint32_t M, uint32_t K, uint32_t N) {
         if (!batch_open_) throw std::runtime_error("rawllm_vulkan: queue_matmul_f16() called outside begin_batch()/end_batch()");
-        if (!coop_matrix_supported_)
-            throw std::runtime_error("rawllm_vulkan: queue_matmul_f16() called but this device doesn't support "
+        if (!coop_matrix_supported_ || pipeline_matmul_f16_ == VK_NULL_HANDLE)
+            throw std::runtime_error("rawllm_vulkan: queue_matmul_f16() called but this device doesn't support (or matmul_coopmat_f16.spv is missing for) "
                 "VK_KHR_cooperative_matrix with a 16x16x16 fp16xfp16->f32 subgroup shape "
                 "— check coop_matrix_supported() first");
         if (K % kCoopTile != 0 || N % kCoopTile != 0)
@@ -888,6 +938,7 @@ public:
     // shader's math, not that queue_matmul_f32() wires it up correctly.
     void queue_matmul_f32(const GpuTensor& W, const float* X, float* Y, uint32_t M, uint32_t K, uint32_t N) {
         if (!batch_open_) throw std::runtime_error("rawllm_vulkan: queue_matmul_f32() called outside begin_batch()/end_batch()");
+        if (pipeline_matmul_f32_ == VK_NULL_HANDLE) throw std::runtime_error("rawllm_vulkan: queue_matmul_f32() called but matmul_tiled_f32.spv wasn't found/built");
         Layout3Slot& slot = next_slot3();
 
         ensure_scratch(slot.x, (VkDeviceSize)M * K * sizeof(float));
@@ -949,6 +1000,7 @@ private:
     void queue_matmul_quantized(VkPipeline pipe, const GpuTensor& W, const float* xs_d, const int32_t* xs_sum,
                                  const int8_t* xs_q, float* Y, uint32_t M, uint32_t K, uint32_t N) {
         if (!batch_open_) throw std::runtime_error("rawllm_vulkan: queue_matmul_quantized() called outside begin_batch()/end_batch()");
+        if (pipe == VK_NULL_HANDLE) throw std::runtime_error("rawllm_vulkan: quantized GEMM called but matmul_tiled_q*_0 .spv wasn't found/built");
         if (K % 32 != 0) throw std::runtime_error("rawllm_vulkan: quantized matmul K must be a multiple of 32");
         uint32_t nb = K / 32u;
         Layout5Slot& slot = next_slot5();
@@ -1042,8 +1094,16 @@ private:
     // constant at build time (see build_pipeline_batched()); only one
     // size built this pass, unlike the multirow family above.
     VkPipeline pipeline_f32_batched_ = VK_NULL_HANDLE;
+    // v2 quantized GEMV pipelines (matvec_q4_0_v2.comp / matvec_q8_0_v2.comp),
+    // indexed by nr_index(): [0]=1, [1]=2, [2]=4 rows per subgroup. All three
+    // built from the same .spv with a different NR specialization constant.
+    // VK_NULL_HANDLE (self-healing) if the .spv isn't found.
+    VkPipeline pipeline_q4v2_[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipeline pipeline_q8v2_[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool quant_v2_dp4a_ = false;
+    uint32_t quant_nr_ = 2;
     VkPipeline pipeline_matmul_f16_ = VK_NULL_HANDLE; // VK_NULL_HANDLE unless coop_matrix_supported_
-    VkPipeline pipeline_matmul_f32_ = VK_NULL_HANDLE; // portable tiled GEMM — always built, no extension required
+    VkPipeline pipeline_matmul_f32_ = VK_NULL_HANDLE; // portable tiled GEMM — built iff matmul_tiled_f32.spv is present
     VkPipeline pipeline_matmul_q4_0_ = VK_NULL_HANDLE; // matmul_tiled_q4_0.spv or _dp4a.spv, see create_pipelines()
     VkPipeline pipeline_matmul_q8_0_ = VK_NULL_HANDLE; // matmul_tiled_q8_0.spv or _dp4a.spv, see create_pipelines()
 
@@ -2065,17 +2125,36 @@ private:
             pipeline_f32_multirow_2_ = build_pipeline_multirow(f32_multirow_path, pipeline_layout3_, 2);
             pipeline_f32_multirow_4_ = build_pipeline_multirow(f32_multirow_path, pipeline_layout3_, 4);
         }
-        // Only attempted when the device actually supports it — a device
-        // without VK_KHR_cooperative_matrix (or without the 16x16x16
-        // fp16xfp16->f32 shape) never needs matmul_coopmat_f16.spv to
-        // exist on disk at all.
-        if (coop_matrix_supported_) {
+        // v2 quantized GEMV (matvec_q4_0_v2/matvec_q8_0_v2): prefer the dp4a
+        // build when the device reports integer-dot-product support AND the
+        // .spv exists; otherwise the portable build; otherwise not built at
+        // all (upload_weight_q4_0_v2() then falls back to the legacy layout).
+        {
+            auto pick = [&](const char* base, std::string& out, bool& dp4a) {
+                dp4a = false;
+                if (dot_product_supported_ && spirv_file_exists(dir + base + "_dp4a.spv")) { out = dir + base + "_dp4a.spv"; dp4a = true; return true; }
+                if (spirv_file_exists(dir + base + ".spv")) { out = dir + base + ".spv"; return true; }
+                return false;
+            };
+            std::string p4, p8; bool d4 = false, d8 = false;
+            if (pick("matvec_q4_0_v2", p4, d4) && pick("matvec_q8_0_v2", p8, d8)) {
+                const uint32_t nrs[3] = {1, 2, 4};
+                for (int i = 0; i < 3; ++i) {
+                    pipeline_q4v2_[i] = build_pipeline_multirow(p4, pipeline_layout5_, nrs[i]);
+                    pipeline_q8v2_[i] = build_pipeline_multirow(p8, pipeline_layout5_, nrs[i]);
+                }
+                quant_v2_dp4a_ = d4 && d8;
+            }
+        }
+        // GEMM pipelines (prefill) are all optional: built only if their .spv
+        // is present, so a checkout with GEMV shaders only — like this branch —
+        // constructs cleanly. queue_matmul_*() throw if theirs wasn't built.
+        if (coop_matrix_supported_ && spirv_file_exists(dir + "matmul_coopmat_f16.spv")) {
             pipeline_matmul_f16_ = build_pipeline_specialized(dir + "matmul_coopmat_f16.spv", pipeline_layout_coopmat_, subgroup_size_);
         }
-        // Portable tiled F32 GEMM: plain shared-memory compute, no
-        // extension and no device-capability check needed — built
-        // unconditionally, same as the four GEMV pipelines above.
-        pipeline_matmul_f32_ = build_pipeline(dir + "matmul_tiled_f32.spv", pipeline_layout_coopmat_);
+        if (spirv_file_exists(dir + "matmul_tiled_f32.spv")) {
+            pipeline_matmul_f32_ = build_pipeline(dir + "matmul_tiled_f32.spv", pipeline_layout_coopmat_);
+        }
 
         // Quantized tiled GEMM (point 12): built unconditionally, same as
         // the F32 GEMM above — no device-capability check gates whether
@@ -2121,8 +2200,10 @@ private:
                     "glslang from source or use the LunarG Vulkan SDK's glslc to get the dp4a speedup.";
             }
         }
-        pipeline_matmul_q4_0_ = build_pipeline(dir + q4_0_variant, pipeline_layout5_mm_);
-        pipeline_matmul_q8_0_ = build_pipeline(dir + q8_0_variant, pipeline_layout5_mm_);
+        if (spirv_file_exists(dir + q4_0_variant) && spirv_file_exists(dir + q8_0_variant)) {
+            pipeline_matmul_q4_0_ = build_pipeline(dir + q4_0_variant, pipeline_layout5_mm_);
+            pipeline_matmul_q8_0_ = build_pipeline(dir + q8_0_variant, pipeline_layout5_mm_);
+        }
     }
 
     void create_descriptor_pool_and_sets() {
@@ -2283,7 +2364,21 @@ private:
         VkDeviceSize size = 0;
         uint32_t type_index = 0;
         std::vector<std::pair<VkDeviceSize, VkDeviceSize>> free_ranges; // sorted by offset, coalesced; {offset, size}
+        // Persistent whole-block mapping, set iff the block's memory type is
+        // HOST_VISIBLE|HOST_COHERENT (mapped once at allocation, unmapped at
+        // destroy_all_blocks()). nullptr otherwise — callers then fall back
+        // to per-call vkMapMemory/vkUnmapMemory. Never call vkMapMemory on a
+        // block with mapped != nullptr (double-map is invalid): go through
+        // persistent_ptr().
+        uint8_t* mapped = nullptr;
     };
+
+    // Host pointer to byte `offset` of block `block` if that block is
+    // persistently mapped, else nullptr.
+    uint8_t* persistent_ptr(size_t block, VkDeviceSize offset) {
+        if (block >= mem_blocks_.size() || !mem_blocks_[block].mapped) return nullptr;
+        return mem_blocks_[block].mapped + offset;
+    }
     std::vector<MemBlock> mem_blocks_;
     static constexpr VkDeviceSize kBlockBytes = 128ull * 1024 * 1024; // grown on demand if a single request exceeds this
 
@@ -2321,6 +2416,15 @@ private:
         vk_check(vkAllocateMemory(device_, &mai, nullptr, &mem), "vkAllocateMemory(pool block)");
         MemBlock blk; blk.mem = mem; blk.size = block_bytes; blk.type_index = type_index;
         blk.free_ranges.push_back({0, block_bytes});
+        {
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            if (type_index < mp.memoryTypeCount && (mp.memoryTypes[type_index].propertyFlags & want) == want) {
+                void* p = nullptr;
+                if (vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) blk.mapped = static_cast<uint8_t*>(p);
+            }
+        }
         mem_blocks_.push_back(blk);
         return sub_alloc(size, alignment, type_index);
     }
@@ -2353,7 +2457,10 @@ private:
     // class already documented on GpuTensor before suballocation existed,
     // just now backed by shared blocks instead of one allocation each.
     void destroy_all_blocks() {
-        for (auto& blk : mem_blocks_) if (blk.mem) vkFreeMemory(device_, blk.mem, nullptr);
+        for (auto& blk : mem_blocks_) {
+            if (blk.mapped) { vkUnmapMemory(device_, blk.mem); blk.mapped = nullptr; }
+            if (blk.mem) vkFreeMemory(device_, blk.mem, nullptr);
+        }
         mem_blocks_.clear();
     }
 
@@ -2380,6 +2487,7 @@ private:
     }
 
     void upload(GpuBuffer& b, const void* src, VkDeviceSize bytes) {
+        if (uint8_t* p = persistent_ptr(b.alloc.block, b.alloc.offset)) { std::memcpy(p, src, (size_t)bytes); return; }
         void* mapped;
         vk_check(vkMapMemory(device_, b.alloc.mem, b.alloc.offset, bytes, 0, &mapped), "vkMapMemory (upload)");
         std::memcpy(mapped, src, (size_t)bytes);
@@ -2387,6 +2495,7 @@ private:
     }
 
     void download(GpuBuffer& b, void* dst, VkDeviceSize bytes) {
+        if (uint8_t* p = persistent_ptr(b.alloc.block, b.alloc.offset)) { std::memcpy(dst, p, (size_t)bytes); return; }
         void* mapped;
         vk_check(vkMapMemory(device_, b.alloc.mem, b.alloc.offset, bytes, 0, &mapped), "vkMapMemory (download)");
         std::memcpy(dst, mapped, (size_t)bytes);
@@ -2441,6 +2550,7 @@ private:
         vk_check(vkBindBufferMemory(device_, t.buf, t.mem, t.offset), "vkBindBufferMemory(weight)");
 
         if (choice.host_visible) {
+            if (uint8_t* p = persistent_ptr(t.block_index, t.offset)) { std::memcpy(p, data, (size_t)bytes); return t; }
             void* mapped;
             vk_check(vkMapMemory(device_, t.mem, t.offset, bytes, 0, &mapped), "vkMapMemory(weight)");
             std::memcpy(mapped, data, (size_t)bytes);
@@ -2454,7 +2564,9 @@ private:
         // bytes padding tail is left as whatever vkCreateBuffer/driver
         // gives a fresh allocation (never read by any valid dispatch).
         ensure_scratch(staging_buf_, bytes);
-        {
+        if (uint8_t* p = persistent_ptr(staging_buf_.alloc.block, staging_buf_.alloc.offset)) {
+            std::memcpy(p, data, (size_t)bytes);
+        } else {
             void* mapped;
             vk_check(vkMapMemory(device_, staging_buf_.alloc.mem, staging_buf_.alloc.offset, bytes, 0, &mapped), "vkMapMemory(staging)");
             std::memcpy(mapped, data, (size_t)bytes);
@@ -2727,6 +2839,48 @@ private:
         vkCmdDispatch(cmd_[cur_], tiles_m, tiles_n, 1);
     }
 
+
+    uint32_t nr_index() const { return quant_nr_ == 1 ? 0u : (quant_nr_ == 2 ? 1u : 2u); }
+
+    // v2 path: activations go up as the raw int8 bytes (read in-shader as
+    // uvec4 — no 8-bit-storage extension, no host widening loop, 4x less
+    // upload than the legacy portable path), dispatch uses the NR-aware
+    // group count. Same 5-binding layout/push constants as the legacy path.
+    void queue_matvec_quantized_v2(VkPipeline pipe, const GpuTensor& W, const float* x_d, const int32_t* x_sum,
+                                    const int8_t* x_q, float* y, uint32_t cols, uint32_t rows) {
+        if (!batch_open_) throw std::runtime_error("rawllm_vulkan: queue_matvec_quantized_v2() called outside begin_batch()/end_batch()");
+        if (cols % 32 != 0) throw std::runtime_error("rawllm_vulkan: quantized matvec cols must be a multiple of 32");
+        uint32_t nb = cols / 32u;
+        Layout5Slot& slot = next_slot5();
+        ensure_scratch(slot.xq, (VkDeviceSize)cols);
+        ensure_scratch(slot.xd, (VkDeviceSize)nb * sizeof(float));
+        ensure_scratch(slot.xsum, (VkDeviceSize)nb * sizeof(int32_t));
+        ensure_scratch(slot.y, (VkDeviceSize)rows * sizeof(float));
+        upload(slot.xq, x_q, (VkDeviceSize)cols);
+        upload(slot.xd, x_d, (VkDeviceSize)nb * sizeof(float));
+        upload(slot.xsum, x_sum, (VkDeviceSize)nb * sizeof(int32_t));
+        bind_descriptors5(pipeline_layout5_, slot.set, W.buf, slot.xq.buf, slot.xd.buf, slot.xsum.buf, slot.y.buf);
+        record_dispatch_multirow(pipe, pipeline_layout5_, slot.set, cols, rows, quant_nr_);
+        pending_downloads_.push_back({&slot.y, y, (VkDeviceSize)rows * sizeof(float)});
+    }
+
+    // Repack `nblk` on-disk blocks (src_stride bytes each: 2-byte fp16 scale
+    // then quant_bytes of quants) into [quants: nblk*quant_bytes][scales:
+    // ceil(nblk/8)*16 bytes, fp16 in block order] and upload as one tensor.
+    GpuTensor upload_packed_quant(const uint8_t* raw, size_t nblk, size_t src_stride, size_t quant_bytes) {
+        size_t scale_bytes = ((nblk + 7) / 8) * 16;
+        std::vector<uint8_t> packed(nblk * quant_bytes + scale_bytes, 0);
+        uint8_t* q = packed.data();
+        uint8_t* s = packed.data() + nblk * quant_bytes;
+        for (size_t b = 0; b < nblk; ++b) {
+            const uint8_t* src = raw + b * src_stride;
+            s[2 * b] = src[0]; s[2 * b + 1] = src[1];
+            std::memcpy(q + b * quant_bytes, src + 2, quant_bytes);
+        }
+        GpuTensor t = upload_weight_bytes(packed.data(), (VkDeviceSize)packed.size());
+        t.packed = true;
+        return t;
+    }
 
     void queue_matvec_quantized(VkPipeline pipe, const GpuTensor& W, const float* x_d, const int32_t* x_sum,
                                  const int8_t* x_q, float* y, uint32_t cols, uint32_t rows) {
