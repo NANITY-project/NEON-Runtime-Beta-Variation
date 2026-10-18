@@ -56,6 +56,9 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace repack {
 
@@ -398,6 +401,25 @@ inline std::unordered_map<const void*, std::unique_ptr<Packed>>& cache_map() {
     static std::unordered_map<const void*, std::unique_ptr<Packed>> m; return m;
 }
 
+// Decode streams every packed byte once per token from DRAM, so TLB misses on 4 KB pages cost real
+// bandwidth (measured ~15-20% on a 110 MB Q4 matrix). Large buffers are 2 MB-aligned and marked
+// MADV_HUGEPAGE before first touch (needs THP "madvise" or "always"; silently a no-op otherwise).
+// Release with std::free as before. Set RAWLLM_NO_THP=1 to opt out.
+inline uint8_t* alloc_weights(size_t total) {
+    constexpr size_t HP = 2u << 20;
+#if defined(__linux__)
+    static const bool thp = [] { const char* e = std::getenv("RAWLLM_NO_THP"); return !(e && *e && *e != '0'); }();
+    if (thp && total >= 2 * HP) {
+        const size_t sz = (total + HP - 1) & ~(HP - 1);
+        if (auto* p = static_cast<uint8_t*>(std::aligned_alloc(HP, sz))) {
+            madvise(p, sz, MADV_HUGEPAGE);
+            return p;
+        }
+    }
+#endif
+    return static_cast<uint8_t*>(std::aligned_alloc(64, (total + 63) & ~(size_t)63));
+}
+
 // Returns the packed form of the tensor whose GGUF-layout data starts at `src`, building it
 // (in parallel on `pool`) the first time. Returns nullptr when repacking is disabled, the
 // tensor has < 8 rows, allocation failed, or the same pointer was previously seen with a
@@ -419,7 +441,7 @@ inline const Packed* get_or_build(const uint8_t* src, Kind kind, size_t rows, si
     pk->kind = kind; pk->rows = prow; pk->cols = cols; pk->nb = cols / 32;
     pk->panel_bytes = pk->nb * (kind == Kind::Q4_0 ? Q4_BLK : Q8_BLK);
     const size_t total = (prow / PR) * pk->panel_bytes;
-    pk->data = static_cast<uint8_t*>(std::aligned_alloc(64, (total + 63) & ~(size_t)63));
+    pk->data = alloc_weights(total);
     if (pk->data) {
         const size_t npan = prow / PR;
         auto build = [&, kind](size_t p0, size_t p1) {
