@@ -26,10 +26,17 @@ What it does, automatically:
      matvec (vec4 + scalar paths), x2, multirow 1/2/4, F16, Q4_0, Q8_0,
      stale-data stress (descriptor-dedup path), multi-op batching and matmul
      F32 (only if its shader exists), then benchmarks
-  6. prints a table, writes vulkan_selftest_report.json, exit code 0 = all pass
+  6. LLAMA.CPP COMPARISON: downloads (git clone) and builds llama.cpp's Vulkan backend
+     (target test-backend-ops only, cached after the first build; the first build
+     takes roughly 10-30 min on a small VM), runs its MUL_MAT matvec benchmark
+     (n=1, the decode shape: 4096 x 14336, f32/f16/q4_0/q8_0) on the same GPU,
+     then runs NEON's backend on the exact same shapes and prints a side-by-side
+     table with NEON/llama.cpp ratios. Skip with --no-llama
+  7. prints a table, writes vulkan_selftest_report.json, exit code 0 = all pass
 
 Useful flags:  --full  (bigger shapes)   --no-bench   --shaders-only
                --lavapipe (force Mesa software Vulkan)   --no-auto-install
+               --no-llama (skip the llama.cpp comparison)   --llama-dir DIR (reuse a checkout/build)
 """
 import argparse, io, json, os, platform, re, shutil, stat, subprocess, sys, tarfile, textwrap, time, urllib.request, zipfile
 from pathlib import Path
@@ -59,6 +66,15 @@ PKGS = {
     "pacman": {"shader": ["glslang"], "vkdev": ["vulkan-headers", "vulkan-icd-loader"], "cxx": ["base-devel"], "runtime": ["vulkan-swrast", "vulkan-tools"]},
     "brew":   {"shader": ["glslang"], "vkdev": ["vulkan-headers", "vulkan-loader"], "cxx": [], "runtime": ["molten-vk", "vulkan-tools"]},
 }
+LLAMA_URL = "https://github.com/ggml-org/llama.cpp.git"
+LLAMA_PKGS = {
+    "apt": ["git", "cmake", "ninja-build", "glslc", "spirv-headers", "libvulkan-dev"],
+    "dnf": ["git", "cmake", "ninja-build", "glslc", "spirv-headers-devel", "vulkan-loader-devel", "vulkan-headers"],
+    "pacman": ["git", "cmake", "ninja", "shaderc", "spirv-headers", "vulkan-headers", "vulkan-icd-loader"],
+    "brew": ["git", "cmake", "ninja", "shaderc", "spirv-headers", "vulkan-headers", "vulkan-loader"],
+}
+CMP_TYPES = ["f32", "f16", "q4_0", "q8_0"]
+CMP_ROWS, CMP_COLS = 4096, 14336  # llama.cpp's own perf shape for MUL_MAT n=1 (decode matvec)
 GLSLANG_KEYS = {"Linux": "linux-x86_64", "Darwin": "macos-universal", "Windows": "windows-x86_64"}
 GLSLANG_BASE = "https://github.com/KhronosGroup/glslang/releases"
 VKHEADERS_URL = "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/heads/main"
@@ -345,6 +361,110 @@ def ensure_nvidia_vulkan(args, build: Path, devs):
     return new or devs
 
 
+def llama_binary(root: Path):
+    bindir = root / "build" / "bin"
+    for name in ("test-backend-ops", "test-backend-ops.exe"):
+        if (bindir / name).exists():
+            return str(bindir / name)
+    return None
+
+
+def ensure_llama(args, build: Path):
+    """Clone + build llama.cpp's test-backend-ops with the Vulkan backend. Returns the binary path or None."""
+    root = Path(args.llama_dir).resolve() if args.llama_dir else build / "llama.cpp"
+    exe = llama_binary(root)
+    if exe:
+        print("  reusing existing llama.cpp build:", exe)
+        return exe
+    pm = pkg_manager()
+    spirv_ok = any(Path(p).exists() for p in ("/usr/include/spirv/unified1/spirv.hpp", "/usr/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake",
+                                              "/usr/lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake", "/usr/share/cmake/SPIRV-Headers"))
+    missing = [t for t in ("git", "cmake", "glslc") if not shutil.which(t)] + ([] if spirv_ok else ["spirv-headers"])
+    if missing:
+        print("  llama.cpp build needs:", ", ".join(missing))
+        if not args.no_auto_install and pm in LLAMA_PKGS:
+            pm_install(pm, LLAMA_PKGS[pm])
+        still = [t for t in ("git", "cmake", "glslc") if not shutil.which(t)]
+        if still:
+            print("  still missing:", ", ".join(still), "- cannot build llama.cpp. Install them (e.g. apt: cmake glslc spirv-headers) and re-run.")
+            return None
+    if not (root / "CMakeLists.txt").exists():
+        print("  cloning", LLAMA_URL)
+        r = sh(["git", "clone", "--depth", "1", LLAMA_URL, str(root)])
+        if r.returncode != 0:
+            print("  git clone failed:", ((r.stderr or r.stdout).strip().splitlines() or ["?"])[-1])
+            return None
+    gen = ["-G", "Ninja"] if shutil.which("ninja") else []
+    cfg = ["cmake", "-S", str(root), "-B", str(root / "build")] + gen + [
+        "-DCMAKE_BUILD_TYPE=Release", "-DGGML_VULKAN=ON", "-DLLAMA_BUILD_COMMON=ON", "-DLLAMA_BUILD_TESTS=ON",
+        "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_TOOLS=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DGGML_NATIVE=ON"]
+    r = sh(cfg)
+    if r.returncode != 0:
+        print("  llama.cpp configure failed:\n" + "\n".join((r.stdout + r.stderr).strip().splitlines()[-12:]))
+        return None
+    jobs = str(os.cpu_count() or 2)
+    print(f"  building llama.cpp (Vulkan, target test-backend-ops, -j{jobs}); first build can take 10-30 min, it is cached afterwards")
+    log = build / "llama_build.log"
+    t0, last = time.time(), 0.0
+    with open(log, "w") as lf:
+        proc = subprocess.Popen(["cmake", "--build", str(root / "build"), "--target", "test-backend-ops", "-j", jobs],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            lf.write(line)
+            m = re.match(r"\[(\d+)/(\d+)\]", line)
+            if m and time.time() - last > 45:
+                print(f"    ... {m.group(1)}/{m.group(2)} ({int(time.time() - t0)}s)", flush=True)
+                last = time.time()
+        proc.wait()
+    if proc.returncode != 0:
+        print("  llama.cpp build failed; last log lines:\n" + "\n".join(log.read_text().splitlines()[-15:]))
+        return None
+    print(f"  built in {int(time.time() - t0)}s")
+    return llama_binary(root)
+
+
+def llama_vulkan_devices(exe):
+    """Which Vulkan backends does llama.cpp's test binary see? Returns [(backend_name, description)].
+    (llama.cpp skips software Vulkan devices such as lavapipe on its own.)"""
+    r = sh([exe, "perf", "-o", "MUL_MAT", "-p", "zzz_no_such_case"])
+    txt = r.stdout + "\n" + r.stderr
+    return re.findall(r"Backend \d+/\d+:\s*(Vulkan\d+)\s*\n\s*Device description:\s*(.+)", txt)
+
+
+def run_llama_perf(exe):
+    """Run MUL_MAT n=1 perf on the best (non-software) Vulkan device. Returns (device_name, {type: row})."""
+    devs = llama_vulkan_devices(exe)
+    if not devs:
+        print("  llama.cpp sees no Vulkan GPU (it ignores software devices like lavapipe), or its output format changed.")
+        return None, {}
+    bname, name = devs[0]
+    types = "|".join(CMP_TYPES)
+    pat = rf"type_a=({types}),type_b=f32,m={CMP_ROWS},n=1,k={CMP_COLS},bs=\[1,1\]"
+    r = sh([exe, "perf", "-o", "MUL_MAT", "-b", bname, "-p", pat, "--output", "sql"])
+    out = {}
+    for line in r.stdout.splitlines():
+        if not line.startswith("INSERT INTO"):
+            continue
+        head, _, vals = line.partition(") VALUES (")
+        fields = [f.strip() for f in head[head.index("(") + 1:].split(",")]
+        values = [v.replace("''", "'") for v in re.findall(r"'((?:[^']|'')*)'", vals)]
+        if len(values) != len(fields):
+            continue
+        row = dict(zip(fields, values))
+        m = re.search(r"type_a=(\w+),.*?m=(\d+),n=(\d+),k=(\d+)", row.get("op_params", ""))
+        if not m or row.get("supported") != "1" or float(row.get("time_us", 0) or 0) <= 0:
+            continue
+        out[m.group(1)] = dict(us=float(row["time_us"]), gbs=float(row["bandwidth_gb_s"]), rows=int(m.group(2)), cols=int(m.group(4)),
+                               device=row.get("device_description", name), backend=row.get("backend_name", ""))
+    if not out:
+        print("  llama.cpp produced no parseable MUL_MAT results:\n" + "\n".join((r.stdout + r.stderr).strip().splitlines()[-8:]))
+    return name, out
+
+
+def weight_bytes(t, rows, cols):
+    return {"f32": 4.0, "f16": 2.0, "q4_0": 18 / 32, "q8_0": 34 / 32}[t] * rows * cols
+
+
 def device_summary():
     vi = which_any("vulkaninfo")
     if not vi:
@@ -529,8 +649,8 @@ static std::vector<double> fref(const std::vector<float>& W, const std::vector<f
 
 int main(int argc, char** argv) {
     std::string shaders = argc > 1 ? argv[1] : "shaders";
-    bool full = false, bench = true; int iters = 200;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "--full") full = true; else if (a == "--no-bench") bench = false; else if (a.rfind("--iters=", 0) == 0) iters = std::atoi(a.c_str() + 8); }
+    bool full = false, bench = true; int iters = 200; std::string cmp_arg;
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "--full") full = true; else if (a == "--no-bench") bench = false; else if (a.rfind("--iters=", 0) == 0) iters = std::atoi(a.c_str() + 8); else if (a.rfind("--compare=", 0) == 0) cmp_arg = a.substr(10); }
 
     std::unique_ptr<VulkanMatvecBackend> bk;
     try { bk = std::make_unique<VulkanMatvecBackend>(shaders, 16, ""); }
@@ -656,6 +776,51 @@ int main(int argc, char** argv) {
         if (bk->matvec_multirow_available(4)) timeit("bench_f32_multirow4_" + std::to_string(N), 2.0 * N * N, 4.0 * N * N, [&] { bk->matvec_f32_multirow(4, tf, x.data(), y.data(), N, N); });
         bk->free_tensor(tf); bk->free_tensor(t4); bk->free_tensor(t8);
     }
+
+    // 9. llama.cpp-comparable shapes: single-token matvec, rows x cols, per weight type. Two timings per case:
+    //    blocking = one submit per call incl. activation upload + result download (worst case, what matvec_*() does),
+    //    batched  = 16 matvecs in ONE submit divided by 16 (amortizes submit/sync, closest to llama.cpp's graph-run timing).
+    {
+        size_t p0 = 0;
+        while (p0 < cmp_arg.size()) {
+            size_t p1 = cmp_arg.find(',', p0); if (p1 == std::string::npos) p1 = cmp_arg.size();
+            std::string item = cmp_arg.substr(p0, p1 - p0); p0 = p1 + 1;
+            size_t a = item.find(':'), b = item.find(':', a + 1); if (a == std::string::npos || b == std::string::npos) continue;
+            std::string ty = item.substr(0, a); uint32_t R = (uint32_t)std::stoul(item.substr(a + 1, b - a - 1)), C = (uint32_t)std::stoul(item.substr(b + 1));
+            std::string tag = ty + "_" + std::to_string(R) + "x" + std::to_string(C);
+            guarded("cmp_" + tag, [&] {
+                if (ty == "f16" && (!bk->fp16_matvec_available() || C % 8)) { emit("cmp_blocking_" + tag, "SKIP", 0, 0, "f16 matvec unavailable"); return; }
+                if ((ty == "q4_0" || ty == "q8_0") && C % 32) { emit("cmp_blocking_" + tag, "SKIP", 0, 0, "cols not multiple of 32"); return; }
+                std::vector<float> W((size_t)R * C), x(C), y(R); fillv(W); fillv(x);
+                GpuTensor t; double wbytes = 0; QAct qa; QW qw;
+                if (ty == "f32") { t = bk->upload_weight_f32(W.data(), R, C); wbytes = 4.0 * R * C; }
+                else if (ty == "f16") { t = bk->upload_weight_f16(W.data(), R, C); wbytes = 2.0 * R * C; }
+                else if (ty == "q4_0") { qw = quant_w4(W, R, C); qa = quant_act(x); t = bk->upload_weight_q4_0(qw.bytes.data(), R, C); wbytes = (double)qw.bytes.size(); }
+                else if (ty == "q8_0") { qw = quant_w8(W, R, C); qa = quant_act(x); t = bk->upload_weight_q8_0(qw.bytes.data(), R, C); wbytes = (double)qw.bytes.size(); }
+                else { emit("cmp_blocking_" + tag, "SKIP", 0, 0, "unknown type"); return; }
+                W.clear(); W.shrink_to_fit(); qw = QW{};
+                auto one = [&](float* yy) {
+                    if (ty == "f32") bk->queue_matvec_f32(t, x.data(), yy, C, R);
+                    else if (ty == "f16") bk->queue_matvec_f16(t, x.data(), yy, C, R);
+                    else if (ty == "q4_0") bk->queue_matvec_q4_0(t, qa.d.data(), qa.sum.data(), qa.q.data(), yy, C, R);
+                    else bk->queue_matvec_q8_0(t, qa.d.data(), qa.sum.data(), qa.q.data(), yy, C, R);
+                };
+                const int N = 16; std::vector<std::vector<float>> ys(N, std::vector<float>(R));
+                int it = std::max(10, std::min(iters, 100));
+                auto blocking = [&] { bk->begin_batch(); one(y.data()); bk->wait_batch(bk->end_batch()); };
+                auto batched = [&] { bk->begin_batch(); for (int i = 0; i < N; ++i) one(ys[i].data()); bk->wait_batch(bk->end_batch()); };
+                for (int i = 0; i < 5; ++i) { blocking(); batched(); }
+                auto t0 = clk::now(); for (int i = 0; i < it; ++i) blocking(); auto t1 = clk::now();
+                double us_b = std::chrono::duration<double, std::micro>(t1 - t0).count() / it;
+                t0 = clk::now(); for (int i = 0; i < std::max(3, it / 4); ++i) batched(); t1 = clk::now();
+                double us_m = std::chrono::duration<double, std::micro>(t1 - t0).count() / std::max(3, it / 4) / N;
+                double fl = 2.0 * R * C;
+                emit("cmp_blocking_" + tag, "BENCH", 0, 0, "1 matvec per submit", us_b, fl / (us_b * 1e-6) / 1e9, wbytes / (us_b * 1e-6) / 1e9);
+                emit("cmp_batched_" + tag, "BENCH", 0, 0, "16 matvecs per submit, per-op", us_m, fl / (us_m * 1e-6) / 1e9, wbytes / (us_m * 1e-6) / 1e9);
+                bk->free_tensor(t);
+            });
+        }
+    }
     return 0;
 }
 '''
@@ -687,6 +852,8 @@ def main():
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--shaders-only", action="store_true", help="only compile shaders and report")
     ap.add_argument("--lavapipe", action="store_true", help="force Mesa lavapipe (CPU Vulkan) via VK_ICD_FILENAMES")
+    ap.add_argument("--no-llama", action="store_true", help="skip the llama.cpp download/build/comparison")
+    ap.add_argument("--llama-dir", help="existing llama.cpp checkout (with or without a build/) to use instead of build-dir/llama.cpp")
     ap.add_argument("--require-gpu", action="store_true", help="exit with an error if only a software Vulkan device is available")
     ap.add_argument("--no-auto-install", action="store_true", help="don't install/download missing tools; just report them")
     ap.add_argument("--install-deps", action="store_true", help=argparse.SUPPRESS)  # legacy, now the default behaviour
@@ -778,6 +945,8 @@ def main():
 
     banner("running")
     cmd = [str(exe), str(shader_dir)] + (["--full"] if args.full else []) + (["--no-bench"] if args.no_bench else []) + [f"--iters={args.iters}"]
+    if not args.no_bench:
+        cmd.append("--compare=" + ",".join(f"{t}:{CMP_ROWS}:{CMP_COLS}" for t in CMP_TYPES))
     t0 = time.time()
     proc = sh(cmd, cwd=build)
     results = []
@@ -802,7 +971,7 @@ def main():
         err = f"{r['err']:.2e}" if r["err"] >= 0 else "-"
         tol = f"{r['tol']:.0e}" if r["tol"] > 0 else "-"
         print(f"{r['name']:<34}{r['status']:<7}{err:>11}{tol:>9}  {r['note'][:60]}")
-    bn = [r for r in results if r["status"] == "BENCH"]
+    bn = [r for r in results if r["status"] == "BENCH" and not r["name"].startswith("cmp_")]
     if bn:
         print(f"\n{'benchmark':<34}{'us/call':>10}{'GFLOP/s':>10}{'GB/s':>9}")
         for r in bn:
@@ -811,6 +980,45 @@ def main():
             print("(device is a software rasterizer: timings are meaningless, only correctness counts)")
             if shutil.which("nvidia-smi"):
                 print("An NVIDIA GPU is present but was NOT used: Vulkan can't see its driver. Re-run with --require-gpu to fail fast.")
+    # ---- llama.cpp comparison ----
+    if not args.no_bench and not args.no_llama:
+        banner("llama.cpp comparison")
+        neon = {}
+        for r in results:
+            m = re.match(r"cmp_(blocking|batched)_(\w+?)_(\d+)x(\d+)$", r["name"])
+            if m and r["status"] == "BENCH":
+                neon.setdefault(m.group(2), {})[m.group(1)] = r
+        exe_l = ensure_llama(args, build)
+        llama_dev, llama = (None, {})
+        if exe_l:
+            print("  running llama.cpp test-backend-ops perf (MUL_MAT, n=1) ...")
+            llama_dev, llama = run_llama_perf(exe_l)
+        report["llama"] = dict(device=llama_dev, results=llama)
+        if llama and neon:
+            print(f"\nMUL_MAT matvec (n=1), {CMP_ROWS} x {CMP_COLS}, same GPU, weights resident. us per matvec, lower is better.")
+            print(f"llama.cpp device: {llama_dev}")
+            print(f"\n{'type':<7}{'llama.cpp':>11}{'NEON batched':>14}{'NEON blocking':>15}{'batched/llama':>15}{'blocking/llama':>16}   GB/s (llama | NEON batched)")
+            for t in CMP_TYPES:
+                l, n = llama.get(t), neon.get(t, {})
+                if not l or "batched" not in n:
+                    lus = "n/a" if not l else "%.1f" % l["us"]
+                    print(f"{t:<7}{lus:>11}{'n/a':>14}")
+                    continue
+                nb, nk = n["batched"], n.get("blocking")
+                gl = weight_bytes(t, CMP_ROWS, CMP_COLS) / (l["us"] * 1e-6) / 1e9
+                print(f"{t:<7}{l['us']:>11.1f}{nb['us']:>14.1f}{(nk['us'] if nk else float('nan')):>15.1f}"
+                      f"{nb['us'] / l['us']:>14.2f}x{(nk['us'] / l['us'] if nk else float('nan')):>15.2f}x   {gl:7.1f} | {nb['gbs']:7.1f}")
+            print("\nratio > 1.00x means NEON is slower than llama.cpp. How to read this fairly:\n"
+                  "  * llama.cpp's number is a GPU graph run with the weights AND activation already on the device;\n"
+                  "    'NEON batched' (16 matvecs per submit, per op) is the closest equivalent. 'NEON blocking' also pays\n"
+                  "    submit + activation upload + result download every call, which is what matvec_*() does today.\n"
+                  "  * for q4_0/q8_0, llama.cpp most likely quantizes the activation on the GPU inside its timed graph, while\n"
+                  "    NEON's activation quantization happens on the host and is NOT in NEON's time (favours NEON slightly).\n"
+                  "  * Kernel-level matvec comparison only, one shape: it is not a tokens/s comparison of the two runtimes.")
+            if is_software(devs):
+                print("  * software rasterizer in use: ignore all timings.")
+        elif not exe_l:
+            print("llama.cpp comparison skipped (see messages above). NEON-only numbers are in the cmp_* rows of vulkan_selftest_report.json.")
     passed = sum(r["status"] == "PASS" for r in results)
     skipped = sum(r["status"] == "SKIP" for r in results)
     print(f"\n{passed} passed, {fails} failed, {skipped} skipped  ({time.time() - t0:.1f}s)")
