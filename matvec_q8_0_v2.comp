@@ -1,0 +1,110 @@
+#version 450
+// =============================================================================
+// matvec_q8_0_v2.comp — Q8_0(weight) x Q8_0(activation) GEMV with aligned
+// 128-bit weight loads, packed int8 activations and an optional dp4a variant.
+// Same design and rationale as matvec_q4_0_v2.comp — read that header first;
+// only the differences are listed here.
+//
+// v2 WEIGHT LAYOUT (built once at upload time by the host):
+//   One buffer, two regions, bound as a single uvec4[] at binding 0:
+//     [ quants : rows*nb*2 uvec4 ][ scales : ceil(rows*nb / 8) uvec4 ]
+//   * A Q8_0 block's 32 signed int8 values are exactly two uvec4 (32 bytes,
+//     32-byte aligned): block (row, b) is uvec4 2*(row*nb+b) and +1; word m
+//     holds weights 4m..4m+3 little-endian, so it pairs directly with
+//     activation word m of the same block.
+//   * scales: fp16, two per uint, block order (halfword row*nb+b). The on-disk
+//     block is 34 bytes; this is 33 bytes/block — nothing widened.
+//   * scale_base (uvec4 units) = rows*nb*2, derived from push constants.
+//
+// Per block: 8 dot4's against activation words, no bias term (Q8_0 weights are
+// already signed). dot4 = dotPacked4x8AccSatEXT under -DHAS_INT8_DOT=1, a
+// portable signed bitfieldExtract chain otherwise; bit-identical results.
+//
+// Contract (same bindings as matvec_q4_0_v2.comp):
+//   binding 0: W   — uvec4[]  binding 1: XQ — uvec4[] (cols/16)
+//   binding 2: XD  — float[]  binding 3: XS — int[] (unused here, bound for
+//                              layout compatibility with the Q4_0 pipeline)
+//   binding 4: Y   — float[] (rows, writeonly)
+//   push constants: { uint cols; uint rows; }, cols % 32 == 0
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef HAS_INT8_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+layout(constant_id = 0) const uint NR = 2u;
+const uint MAX_NR = 4u;
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly restrict buffer WBuf  { uvec4 W[];  };
+layout(std430, binding = 1) readonly restrict buffer XQBuf { uvec4 XQ[]; };
+layout(std430, binding = 2) readonly restrict buffer XDBuf { float XD[]; };
+layout(std430, binding = 3) readonly restrict buffer XSBuf { int   XS[]; };
+layout(std430, binding = 4) writeonly restrict buffer YBuf { float Y[];  };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+int dot4(uint a, uint b, int acc) {
+#ifdef HAS_INT8_DOT
+    return dotPacked4x8AccSatEXT(int(a), int(b), acc); // signed overload takes int args
+#else
+    acc += bitfieldExtract(int(a),  0, 8) * bitfieldExtract(int(b),  0, 8);
+    acc += bitfieldExtract(int(a),  8, 8) * bitfieldExtract(int(b),  8, 8);
+    acc += bitfieldExtract(int(a), 16, 8) * bitfieldExtract(int(b), 16, 8);
+    acc += bitfieldExtract(int(a), 24, 8) * bitfieldExtract(int(b), 24, 8);
+    return acc;
+#endif
+}
+
+void main() {
+    uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= params.rows) return; // subgroup-uniform
+
+    uint nb = params.cols >> 5u;
+    uint scale_base = params.rows * nb * 2u;
+    uint lane = gl_SubgroupInvocationID;
+    uint sg = gl_SubgroupSize;
+
+    float acc[MAX_NR];
+    for (uint r = 0u; r < MAX_NR; ++r) acc[r] = 0.0;
+
+    for (uint b = lane; b < nb; b += sg) {
+        uvec4 xa = XQ[2u * b];
+        uvec4 xb = XQ[2u * b + 1u];
+        float xd = XD[b];
+
+        for (uint r = 0u; r < NR; ++r) {
+            uint row = row0 + r;
+            if (row < params.rows) {
+                uint blk = row * nb + b;
+                uvec4 wa = W[2u * blk];
+                uvec4 wb = W[2u * blk + 1u];
+                uint sw = W[scale_base + (blk >> 3u)][(blk >> 1u) & 3u];
+                float wd = unpackHalf2x16(sw >> ((blk & 1u) * 16u)).x;
+
+                int isum = 0;
+                isum = dot4(wa.x, xa.x, isum);
+                isum = dot4(wa.y, xa.y, isum);
+                isum = dot4(wa.z, xa.z, isum);
+                isum = dot4(wa.w, xa.w, isum);
+                isum = dot4(wb.x, xb.x, isum);
+                isum = dot4(wb.y, xb.y, isum);
+                isum = dot4(wb.z, xb.z, isum);
+                isum = dot4(wb.w, xb.w, isum);
+
+                acc[r] += wd * xd * float(isum);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        float s = subgroupAdd(acc[r]);
+        if (lane == 0u && row0 + r < params.rows) Y[row0 + r] = s;
+    }
+}

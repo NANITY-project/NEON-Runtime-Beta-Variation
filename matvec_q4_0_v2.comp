@@ -1,0 +1,154 @@
+#version 450
+// =============================================================================
+// matvec_q4_0_v2.comp — Q4_0(weight) x Q8_0(activation) GEMV, rewritten around
+// what memory systems actually like: ALIGNED 128-BIT LOADS and PACKED int8
+// ACTIVATIONS, with an optional dp4a (integer dot product) variant.
+//
+// WHY v1 (matvec_q4_0.comp) LEAVES BANDWIDTH ON THE TABLE
+//   v1 reads the on-disk 18-byte Q4_0 block layout directly. 18 is not a
+//   multiple of 4, so every block starts at an arbitrary byte offset: the
+//   shader needs a shift+mask+two-load readWord4() just to fetch 4 bytes, one
+//   lane owns a whole 18-byte block so adjacent lanes read addresses 18 bytes
+//   apart (a 32-lane wave touches ~576 bytes in 32 separate partial sectors),
+//   and the activation side does 32 scalar int loads per block. The result is
+//   a kernel limited by load-instruction count and uncoalesced access, not by
+//   DRAM bandwidth — which is the only thing a GEMV should ever be limited by.
+//
+// v2 LAYOUT (built ONCE at upload time by the host, see
+// VulkanMatvecBackend::upload_weight_q4_0() — the CPU/disk format is unchanged):
+//
+//   One buffer, two regions, bound as a single uvec4[] at binding 0:
+//     [ quants : rows*nb uvec4 ][ scales : ceil(rows*nb / 8) uvec4 ]
+//   * quants: block (row, b) lives at uvec4 index row*nb + b. A Q4_0 block's 16
+//     packed-nibble bytes are EXACTLY one uvec4, 16-byte aligned: byte i holds
+//     weight i in its low nibble and weight i+16 in its high nibble (same as
+//     the on-disk format). Lane L of a subgroup reads uvec4 (row*nb + b0 + L),
+//     so a wave reads one fully contiguous, fully coalesced span.
+//   * scales: the fp16 block scales, packed two per uint, in block order
+//     (blk = row*nb + b -> halfword blk). 18 bytes/block total, same as the
+//     on-disk size — nothing is widened, so no extra bandwidth is spent.
+//   * scale_base (uvec4 units) = rows*nb, derived in-shader from the push
+//     constants, so no extra push constant is needed.
+//
+// ACTIVATIONS (binding 1..3) — packed, no 8-bit-storage extension needed:
+//   XQ  : cols int8 values stored verbatim, read as uvec4[]: block b is uvec4
+//         2b (values 0..15) and 2b+1 (values 16..31); word m of a block holds
+//         values 4m..4m+3, little-endian. This is bit-identical to a plain
+//         int8_t[] array uploaded with memcpy — ZERO host-side work, and 4x
+//         less upload than widening to int32 (v1's portable path).
+//   XD  : per-block activation scale, float[nb]
+//   XS  : per-block sum of the 32 int8 activations, int[nb] (bias correction,
+//         identical to v1: sum((n-8)*x) = sum(n*x) - 8*sum(x))
+//
+// COMPUTE: per block, 8 dot4's: low nibbles of weight word w pair with
+// activation word w, high nibbles with activation word 4+w. Nibbles are 0..15
+// so treating them as signed int8 is exact. dot4 is a single
+// dotPacked4x8AccSatEXT when compiled with -DHAS_INT8_DOT=1 (needs
+// VK_KHR_shader_integer_dot_product at runtime — the host only selects that
+// SPIR-V when the device reports it) and a portable bitfieldExtract
+// multiply-add chain otherwise. Both are exact integer math, so the two
+// variants agree bit-for-bit before the float scale is applied.
+//
+// ROWS PER SUBGROUP (spec constant NR, 1..4): each lane loads the block's
+// activation words ONCE and reuses them for NR rows. At NR=1 the activation
+// traffic per block (40 B) is ~2x the weight traffic (18 B); NR=2..4 amortizes
+// it. All pipelines run local_size_x=256; a workgroup finishes
+// gl_NumSubgroups*NR rows. The host dispatch count must use the same
+// formula (VulkanMatvecBackend::record_dispatch_multirow()).
+//
+// Reduction: subgroupAdd per row, no shared memory, no barrier() (same shape
+// as matvec_f32.comp).
+//
+// Contract:
+//   binding 0: W   — uvec4[]  (layout above)
+//   binding 1: XQ  — uvec4[]  (cols/16 entries)
+//   binding 2: XD  — float[]  (cols/32)
+//   binding 3: XS  — int[]    (cols/32)
+//   binding 4: Y   — float[]  (rows, writeonly)
+//   push constants: { uint cols; uint rows; }, cols % 32 == 0
+// =============================================================================
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef HAS_INT8_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+layout(constant_id = 0) const uint NR = 2u;
+const uint MAX_NR = 4u; // must match the host's bound in build_pipeline_rows()
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly restrict buffer WBuf  { uvec4 W[];  };
+layout(std430, binding = 1) readonly restrict buffer XQBuf { uvec4 XQ[]; };
+layout(std430, binding = 2) readonly restrict buffer XDBuf { float XD[]; };
+layout(std430, binding = 3) readonly restrict buffer XSBuf { int   XS[]; };
+layout(std430, binding = 4) writeonly restrict buffer YBuf { float Y[];  };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+} params;
+
+// a: four bytes, each treated as signed int8 (here always a nibble 0..15)
+// b: four signed int8, packed
+int dot4(uint a, uint b, int acc) {
+#ifdef HAS_INT8_DOT
+    return dotPacked4x8AccSatEXT(int(a), int(b), acc); // signed overload takes int args
+#else
+    acc += bitfieldExtract(int(a),  0, 8) * bitfieldExtract(int(b),  0, 8);
+    acc += bitfieldExtract(int(a),  8, 8) * bitfieldExtract(int(b),  8, 8);
+    acc += bitfieldExtract(int(a), 16, 8) * bitfieldExtract(int(b), 16, 8);
+    acc += bitfieldExtract(int(a), 24, 8) * bitfieldExtract(int(b), 24, 8);
+    return acc;
+#endif
+}
+
+const uint NIB = 0x0F0F0F0Fu;
+
+void main() {
+    uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= params.rows) return; // subgroup-uniform
+
+    uint nb = params.cols >> 5u;
+    uint scale_base = params.rows * nb; // uvec4 index where the scale region starts
+    uint lane = gl_SubgroupInvocationID;
+    uint sg = gl_SubgroupSize;
+
+    float acc[MAX_NR];
+    for (uint r = 0u; r < MAX_NR; ++r) acc[r] = 0.0;
+
+    for (uint b = lane; b < nb; b += sg) {
+        uvec4 xa = XQ[2u * b];      // activation values 0..15
+        uvec4 xb = XQ[2u * b + 1u]; // activation values 16..31
+        float xd = XD[b];
+        int xs8 = 8 * XS[b];
+
+        for (uint r = 0u; r < NR; ++r) {
+            uint row = row0 + r;
+            if (row < params.rows) {
+                uint blk = row * nb + b;
+                uvec4 w = W[blk];
+                uint sw = W[scale_base + (blk >> 3u)][(blk >> 1u) & 3u];
+                float wd = unpackHalf2x16(sw >> ((blk & 1u) * 16u)).x;
+
+                int isum = 0;
+                isum = dot4( w.x        & NIB, xa.x, isum);
+                isum = dot4( w.y        & NIB, xa.y, isum);
+                isum = dot4( w.z        & NIB, xa.z, isum);
+                isum = dot4( w.w        & NIB, xa.w, isum);
+                isum = dot4((w.x >> 4u) & NIB, xb.x, isum);
+                isum = dot4((w.y >> 4u) & NIB, xb.y, isum);
+                isum = dot4((w.z >> 4u) & NIB, xb.z, isum);
+                isum = dot4((w.w >> 4u) & NIB, xb.w, isum);
+
+                acc[r] += wd * xd * float(isum - xs8);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        float s = subgroupAdd(acc[r]);
+        if (lane == 0u && row0 + r < params.rows) Y[row0 + r] = s;
+    }
+}
