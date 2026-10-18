@@ -32,6 +32,10 @@ What it does, automatically:
      (n=1, the decode shape: 4096 x 14336, f32/f16/q4_0/q8_0) on the same GPU,
      then runs NEON's backend on the exact same shapes and prints a side-by-side
      table with NEON/llama.cpp ratios. Skip with --no-llama
+     If an NVIDIA GPU + CUDA toolkit are present it ALSO builds llama.cpp's CUDA backend
+     (separate build, one GPU arch, flash-attention kernels off to cut build time) and adds
+     it as a third column: Vulkan-vs-Vulkan is the like-for-like comparison, the CUDA
+     column is the ceiling to chase. Skip with --no-cuda
   7. prints a table, writes vulkan_selftest_report.json, exit code 0 = all pass
 
 Useful flags:  --full  (bigger shapes)   --no-bench   --shaders-only
@@ -361,33 +365,69 @@ def ensure_nvidia_vulkan(args, build: Path, devs):
     return new or devs
 
 
-def llama_binary(root: Path):
-    bindir = root / "build" / "bin"
+def llama_binary(root: Path, bdir="build"):
+    bindir = root / bdir / "bin"
     for name in ("test-backend-ops", "test-backend-ops.exe"):
         if (bindir / name).exists():
             return str(bindir / name)
     return None
 
 
-def ensure_llama(args, build: Path):
-    """Clone + build llama.cpp's test-backend-ops with the Vulkan backend. Returns the binary path or None."""
+def find_nvcc():
+    hit = which_any("nvcc")
+    if hit:
+        return hit
+    for c in sorted(Path("/usr/local").glob("cuda*/bin/nvcc"), reverse=True):
+        return str(c)
+    return None
+
+
+def cuda_arch():
+    """Compute capability of GPU 0 as '75' for 7.5; None if unknown."""
+    r = sh(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"]) if shutil.which("nvidia-smi") else None
+    if r and r.returncode == 0 and re.match(r"\d+\.\d+", r.stdout.strip()):
+        return r.stdout.strip().splitlines()[0].replace(".", "")
+    return None
+
+
+def ensure_llama(args, build: Path, kind="vulkan"):
+    """Clone (once) + build llama.cpp's test-backend-ops with the Vulkan or CUDA backend. Returns the binary path or None."""
     root = Path(args.llama_dir).resolve() if args.llama_dir else build / "llama.cpp"
-    exe = llama_binary(root)
+    bdir = "build" if kind == "vulkan" else "build-cuda"
+    exe = llama_binary(root, bdir)
     if exe:
-        print("  reusing existing llama.cpp build:", exe)
+        print(f"  reusing existing llama.cpp {kind} build:", exe)
         return exe
     pm = pkg_manager()
     spirv_ok = any(Path(p).exists() for p in ("/usr/include/spirv/unified1/spirv.hpp", "/usr/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake",
                                               "/usr/lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake", "/usr/share/cmake/SPIRV-Headers"))
-    missing = [t for t in ("git", "cmake", "glslc") if not shutil.which(t)] + ([] if spirv_ok else ["spirv-headers"])
+    need = ["git", "cmake"] + (["glslc"] if kind == "vulkan" else [])
+    missing = [t for t in need if not shutil.which(t)] + ([] if (spirv_ok or kind != "vulkan") else ["spirv-headers"])
     if missing:
         print("  llama.cpp build needs:", ", ".join(missing))
         if not args.no_auto_install and pm in LLAMA_PKGS:
             pm_install(pm, LLAMA_PKGS[pm])
-        still = [t for t in ("git", "cmake", "glslc") if not shutil.which(t)]
+        still = [t for t in need if not shutil.which(t)]
         if still:
             print("  still missing:", ", ".join(still), "- cannot build llama.cpp. Install them (e.g. apt: cmake glslc spirv-headers) and re-run.")
             return None
+    extra = []
+    if kind == "cuda":
+        nvcc = find_nvcc()
+        if not nvcc and not args.no_auto_install and pm == "apt":
+            print("  nvcc not found; installing nvidia-cuda-toolkit via apt (several GB, can take a few minutes)")
+            pm_install("apt", ["nvidia-cuda-toolkit"])
+            nvcc = find_nvcc()
+        if not nvcc:
+            print("  no CUDA toolkit (nvcc) available; skipping the CUDA comparison.")
+            return None
+        arch = cuda_arch()
+        extra = ["-DGGML_CUDA=ON", "-DGGML_VULKAN=OFF", "-DGGML_CUDA_FA=OFF", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+        if arch:
+            extra.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
+        print(f"  CUDA: nvcc={nvcc}, arch={arch or 'default (slow: builds many archs)'}")
+    else:
+        extra = ["-DGGML_VULKAN=ON"]
     if not (root / "CMakeLists.txt").exists():
         print("  cloning", LLAMA_URL)
         r = sh(["git", "clone", "--depth", "1", LLAMA_URL, str(root)])
@@ -395,19 +435,20 @@ def ensure_llama(args, build: Path):
             print("  git clone failed:", ((r.stderr or r.stdout).strip().splitlines() or ["?"])[-1])
             return None
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
-    cfg = ["cmake", "-S", str(root), "-B", str(root / "build")] + gen + [
-        "-DCMAKE_BUILD_TYPE=Release", "-DGGML_VULKAN=ON", "-DLLAMA_BUILD_COMMON=ON", "-DLLAMA_BUILD_TESTS=ON",
-        "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_TOOLS=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DGGML_NATIVE=ON"]
+    cfg = ["cmake", "-S", str(root), "-B", str(root / bdir)] + gen + [
+        "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_BUILD_COMMON=ON", "-DLLAMA_BUILD_TESTS=ON",
+        "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_TOOLS=OFF", "-DLLAMA_BUILD_SERVER=OFF", "-DGGML_NATIVE=ON"] + extra
     r = sh(cfg)
     if r.returncode != 0:
         print("  llama.cpp configure failed:\n" + "\n".join((r.stdout + r.stderr).strip().splitlines()[-12:]))
         return None
     jobs = str(os.cpu_count() or 2)
-    print(f"  building llama.cpp (Vulkan, target test-backend-ops, -j{jobs}); first build can take 10-30 min, it is cached afterwards")
-    log = build / "llama_build.log"
+    est = "10-30 min" if kind == "vulkan" else "15-45 min"
+    print(f"  building llama.cpp ({kind}, target test-backend-ops, -j{jobs}); first build can take {est}, it is cached afterwards")
+    log = build / f"llama_build_{kind}.log"
     t0, last = time.time(), 0.0
     with open(log, "w") as lf:
-        proc = subprocess.Popen(["cmake", "--build", str(root / "build"), "--target", "test-backend-ops", "-j", jobs],
+        proc = subprocess.Popen(["cmake", "--build", str(root / bdir), "--target", "test-backend-ops", "-j", jobs],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout:
             lf.write(line)
@@ -420,22 +461,22 @@ def ensure_llama(args, build: Path):
         print("  llama.cpp build failed; last log lines:\n" + "\n".join(log.read_text().splitlines()[-15:]))
         return None
     print(f"  built in {int(time.time() - t0)}s")
-    return llama_binary(root)
+    return llama_binary(root, bdir)
 
 
-def llama_vulkan_devices(exe):
-    """Which Vulkan backends does llama.cpp's test binary see? Returns [(backend_name, description)].
+def llama_vulkan_devices(exe, prefix="Vulkan"):
+    """Which GPU backends (Vulkan or CUDA) does llama.cpp's test binary see? Returns [(backend_name, description)].
     (llama.cpp skips software Vulkan devices such as lavapipe on its own.)"""
     r = sh([exe, "perf", "-o", "MUL_MAT", "-p", "zzz_no_such_case"])
     txt = r.stdout + "\n" + r.stderr
-    return re.findall(r"Backend \d+/\d+:\s*(Vulkan\d+)\s*\n\s*Device description:\s*(.+)", txt)
+    return re.findall(r"Backend \d+/\d+:\s*(%s\d+)\s*\n\s*Device description:\s*(.+)" % prefix, txt)
 
 
-def run_llama_perf(exe):
-    """Run MUL_MAT n=1 perf on the best (non-software) Vulkan device. Returns (device_name, {type: row})."""
-    devs = llama_vulkan_devices(exe)
+def run_llama_perf(exe, prefix="Vulkan"):
+    """Run MUL_MAT n=1 perf on the first GPU device of the given backend. Returns (device_name, {type: row})."""
+    devs = llama_vulkan_devices(exe, prefix)
     if not devs:
-        print("  llama.cpp sees no Vulkan GPU (it ignores software devices like lavapipe), or its output format changed.")
+        print(f"  llama.cpp sees no {prefix} GPU (it ignores software devices like lavapipe), or its output format changed.")
         return None, {}
     bname, name = devs[0]
     types = "|".join(CMP_TYPES)
@@ -852,6 +893,7 @@ def main():
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--shaders-only", action="store_true", help="only compile shaders and report")
     ap.add_argument("--lavapipe", action="store_true", help="force Mesa lavapipe (CPU Vulkan) via VK_ICD_FILENAMES")
+    ap.add_argument("--no-cuda", action="store_true", help="don't build/run llama.cpp's CUDA backend for the comparison")
     ap.add_argument("--no-llama", action="store_true", help="skip the llama.cpp download/build/comparison")
     ap.add_argument("--llama-dir", help="existing llama.cpp checkout (with or without a build/) to use instead of build-dir/llama.cpp")
     ap.add_argument("--require-gpu", action="store_true", help="exit with an error if only a software Vulkan device is available")
@@ -980,44 +1022,67 @@ def main():
             print("(device is a software rasterizer: timings are meaningless, only correctness counts)")
             if shutil.which("nvidia-smi"):
                 print("An NVIDIA GPU is present but was NOT used: Vulkan can't see its driver. Re-run with --require-gpu to fail fast.")
-    # ---- llama.cpp comparison ----
+    # ---- llama.cpp comparison (Vulkan, and CUDA if available) ----
     if not args.no_bench and not args.no_llama:
         banner("llama.cpp comparison")
-        neon = {}
+        neon, neon_err = {}, {}
         for r in results:
             m = re.match(r"cmp_(blocking|batched)_(\w+?)_(\d+)x(\d+)$", r["name"])
             if m and r["status"] == "BENCH":
                 neon.setdefault(m.group(2), {})[m.group(1)] = r
-        exe_l = ensure_llama(args, build)
+            m = re.match(r"cmp_(?:blocking_)?(\w+?)_(\d+)x(\d+)$", r["name"])
+            if m and r["status"] in ("ERROR", "SKIP"):
+                neon_err[m.group(1)] = r["note"]
+        exe_l = ensure_llama(args, build, "vulkan")
         llama_dev, llama = (None, {})
         if exe_l:
-            print("  running llama.cpp test-backend-ops perf (MUL_MAT, n=1) ...")
-            llama_dev, llama = run_llama_perf(exe_l)
-        report["llama"] = dict(device=llama_dev, results=llama)
-        if llama and neon:
-            print(f"\nMUL_MAT matvec (n=1), {CMP_ROWS} x {CMP_COLS}, same GPU, weights resident. us per matvec, lower is better.")
-            print(f"llama.cpp device: {llama_dev}")
-            print(f"\n{'type':<7}{'llama.cpp':>11}{'NEON batched':>14}{'NEON blocking':>15}{'batched/llama':>15}{'blocking/llama':>16}   GB/s (llama | NEON batched)")
+            print("  running llama.cpp test-backend-ops perf (Vulkan, MUL_MAT, n=1) ...")
+            llama_dev, llama = run_llama_perf(exe_l, "Vulkan")
+        cuda_dev, cuda = (None, {})
+        if not args.no_cuda and shutil.which("nvidia-smi"):
+            exe_c = ensure_llama(args, build, "cuda")
+            if exe_c:
+                print("  running llama.cpp test-backend-ops perf (CUDA, MUL_MAT, n=1) ...")
+                cuda_dev, cuda = run_llama_perf(exe_c, "CUDA")
+        report["llama"] = dict(vulkan=dict(device=llama_dev, results=llama), cuda=dict(device=cuda_dev, results=cuda))
+        if (llama or cuda) and (neon or neon_err):
+            print(f"\nMUL_MAT matvec (n=1), {CMP_ROWS} x {CMP_COLS}, same machine, weights resident. us per matvec, lower is better.")
+            if llama_dev: print(f"  llama.cpp Vulkan device: {llama_dev}")
+            if cuda_dev:  print(f"  llama.cpp CUDA device  : {cuda_dev}")
+            have_c, have_v = bool(cuda), bool(llama)
+            hdr = f"\n{'type':<7}" + (f"{'ll.cpp CUDA':>12}" if have_c else "") + (f"{'ll.cpp Vulkan':>14}" if have_v else "") + f"{'NEON batched':>14}{'NEON blocking':>15}"
+            if have_v: hdr += f"{'vs ll.cpp Vk':>14}"
+            if have_c: hdr += f"{'vs ll.cpp CUDA':>16}"
+            print(hdr + "   GB/s: " + ("CUDA | " if have_c else "") + ("llama-Vk | " if have_v else "") + "NEON")
             for t in CMP_TYPES:
-                l, n = llama.get(t), neon.get(t, {})
-                if not l or "batched" not in n:
-                    lus = "n/a" if not l else "%.1f" % l["us"]
-                    print(f"{t:<7}{lus:>11}{'n/a':>14}")
+                lv, lc, n = llama.get(t), cuda.get(t), neon.get(t, {})
+                row = f"{t:<7}"
+                if have_c: row += f"{lc['us']:>12.1f}" if lc else f"{'n/a':>12}"
+                if have_v: row += f"{lv['us']:>14.1f}" if lv else f"{'n/a':>14}"
+                if "batched" not in n:
+                    print(row + f"{'n/a':>14}  <- NEON: {neon_err.get(t, 'no result')[:90]}")
                     continue
                 nb, nk = n["batched"], n.get("blocking")
-                gl = weight_bytes(t, CMP_ROWS, CMP_COLS) / (l["us"] * 1e-6) / 1e9
-                print(f"{t:<7}{l['us']:>11.1f}{nb['us']:>14.1f}{(nk['us'] if nk else float('nan')):>15.1f}"
-                      f"{nb['us'] / l['us']:>14.2f}x{(nk['us'] / l['us'] if nk else float('nan')):>15.2f}x   {gl:7.1f} | {nb['gbs']:7.1f}")
-            print("\nratio > 1.00x means NEON is slower than llama.cpp. How to read this fairly:\n"
-                  "  * llama.cpp's number is a GPU graph run with the weights AND activation already on the device;\n"
-                  "    'NEON batched' (16 matvecs per submit, per op) is the closest equivalent. 'NEON blocking' also pays\n"
-                  "    submit + activation upload + result download every call, which is what matvec_*() does today.\n"
+                row += f"{nb['us']:>14.1f}{(nk['us'] if nk else float('nan')):>15.1f}"
+                if have_v: row += f"{(nb['us'] / lv['us']) if lv else float('nan'):>13.2f}x"
+                if have_c: row += f"{(nb['us'] / lc['us']) if lc else float('nan'):>15.2f}x"
+                g = []
+                if have_c: g.append("%6.1f" % (weight_bytes(t, CMP_ROWS, CMP_COLS) / (lc["us"] * 1e-6) / 1e9) if lc else "   n/a")
+                if have_v: g.append("%6.1f" % (weight_bytes(t, CMP_ROWS, CMP_COLS) / (lv["us"] * 1e-6) / 1e9) if lv else "   n/a")
+                g.append("%6.1f" % nb["gbs"])
+                print(row + "   " + " | ".join(g))
+            print("\nratio > 1.00x means NEON is slower. How to read this:\n"
+                  "  * 'vs ll.cpp Vk' is the like-for-like column (same API, same driver, same GPU). 'vs ll.cpp CUDA' is a\n"
+                  "    different stack (different API + driver + hand-tuned kernels): treat it as the ceiling to chase, not a bug count.\n"
+                  "  * llama.cpp's number is a GPU graph run with weights AND activation already on the device; 'NEON batched'\n"
+                  "    (16 matvecs per submit, per op) is the closest equivalent. 'NEON blocking' also pays submit + activation\n"
+                  "    upload + result download every call, which is what matvec_*() does today.\n"
                   "  * for q4_0/q8_0, llama.cpp most likely quantizes the activation on the GPU inside its timed graph, while\n"
                   "    NEON's activation quantization happens on the host and is NOT in NEON's time (favours NEON slightly).\n"
-                  "  * Kernel-level matvec comparison only, one shape: it is not a tokens/s comparison of the two runtimes.")
+                  "  * Kernel-level matvec comparison only, one shape: not a tokens/s comparison of the two runtimes.")
             if is_software(devs):
                 print("  * software rasterizer in use: ignore all timings.")
-        elif not exe_l:
+        elif not (llama or cuda):
             print("llama.cpp comparison skipped (see messages above). NEON-only numbers are in the cmp_* rows of vulkan_selftest_report.json.")
     passed = sum(r["status"] == "PASS" for r in results)
     skipped = sum(r["status"] == "SKIP" for r in results)
