@@ -9,6 +9,8 @@ format. Everything else — training pipeline, GGUF/.nctr conversion, the
 spec itself — is designed around that one fixed shape on purpose. See
 [`NANITY_ARCHITECTURE_SPEC.md`](./NANITY_ARCHITECTURE_SPEC.md) for the
 full "why" and the exact tensor/metadata contract.
+SmolLM2 (1.7B) has been tested on this, it produces coherent text, follows prompts
+and also works somewhat with idle loop feature.
 
 > **Status: beta ** See
 > [`LICENSE`](./LICENSE) for current terms during the prototyping phase.
