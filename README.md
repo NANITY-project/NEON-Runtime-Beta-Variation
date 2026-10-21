@@ -1,5 +1,5 @@
 NEON — NANITY Runtime (Beta)
-
+NOTE: THERE IS A FULL RELEASE NOW. THIS REPO SERVES AS A HISTORY/DEVELOPMENT (NEW STUFF THAT MAY NOT BE IN FULL RELEASE) AREA.
 A from-scratch C++ inference runtime for **NANITY**, a single fixed
 transformer architecture — not a GGUF-guessing nor every-architecture
 runtime like llama.cpp. NEON loads exactly one thing: a model that
